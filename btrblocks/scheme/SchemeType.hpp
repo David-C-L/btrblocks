@@ -35,6 +35,16 @@ constexpr IntegerSchemeSet defaultIntegerSchemes() {
   return {IntegerSchemeType::UNCOMPRESSED, IntegerSchemeType::ONE_VALUE, IntegerSchemeType::DICT,
           IntegerSchemeType::RLE,          IntegerSchemeType::PFOR,      IntegerSchemeType::BP};
 };
+// The five requested codec "families" plus the two schemes every scheme set
+// must include (see scheme/SchemePool.cpp's die_if(...ONE_VALUE...)/
+// die_if(...UNCOMPRESSED...)): DynamicDictionary, RLE, FBP/PBP/FOR,
+// Uncompressed, Frequency.
+constexpr IntegerSchemeSet restrictedIntegerSchemes() {
+  return {IntegerSchemeType::UNCOMPRESSED, IntegerSchemeType::ONE_VALUE,
+          IntegerSchemeType::DICT,         IntegerSchemeType::RLE,
+          IntegerSchemeType::BP,           IntegerSchemeType::PFOR,
+          IntegerSchemeType::FOR,          IntegerSchemeType::FREQUENCY};
+};
 // ------------------------------------------------------------------------------
 // Native 64-bit sibling of IntegerSchemeType, for ColumnType::BIGINT. Mirrors
 // the 32-bit enum's registered set 1:1 (values need not match the 32-bit
@@ -65,6 +75,14 @@ constexpr Integer64SchemeSet defaultInteger64Schemes() {
   return {Integer64SchemeType::UNCOMPRESSED, Integer64SchemeType::ONE_VALUE,
           Integer64SchemeType::DICT,         Integer64SchemeType::RLE,
           Integer64SchemeType::PFOR,         Integer64SchemeType::BP};
+};
+// 64-bit sibling of restrictedIntegerSchemes(), same five families plus the
+// two always-required schemes.
+constexpr Integer64SchemeSet restrictedInteger64Schemes() {
+  return {Integer64SchemeType::UNCOMPRESSED, Integer64SchemeType::ONE_VALUE,
+          Integer64SchemeType::DICT,         Integer64SchemeType::RLE,
+          Integer64SchemeType::BP,           Integer64SchemeType::PFOR,
+          Integer64SchemeType::FOR,          Integer64SchemeType::FREQUENCY};
 };
 // ------------------------------------------------------------------------------
 enum class DoubleSchemeType : uint8_t {

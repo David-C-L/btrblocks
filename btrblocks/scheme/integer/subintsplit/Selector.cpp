@@ -1,6 +1,7 @@
 // -------------------------------------------------------------------------------------
 #include "scheme/integer/subintsplit/Selector.hpp"
 // -------------------------------------------------------------------------------------
+#include "btrblocks.hpp"
 #include "scheme/SchemeConfig.hpp"
 // -------------------------------------------------------------------------------------
 #include <algorithm>
@@ -10,15 +11,26 @@
 // -------------------------------------------------------------------------------------
 namespace btrblocks::subintsplit {
 // -------------------------------------------------------------------------------------
-const std::vector<const ICostModel*>& defaultCostModels() {
+std::vector<const ICostModel*> defaultCostModels() {
   static const UncompressedCostModel uncompressed;
   static const BitPackingCostModel bitPacking;
   static const OneValueCostModel oneValue;
   static const FrequencyCostModel frequency;
   static const DictionaryCostModel dictionary;
   static const RleCostModel rle;
-  static const std::vector<const ICostModel*> models{&uncompressed, &bitPacking, &oneValue,
-                                                     &frequency,    &dictionary, &rle};
+  static const PforCostModel pfor;
+  static const ForCostModel forModel;
+  static const std::vector<const ICostModel*> allModels{
+      &uncompressed, &bitPacking, &oneValue, &frequency, &dictionary, &rle, &pfor, &forModel};
+
+  const auto& enabled = BtrBlocksConfig::get().integers.schemes;
+  std::vector<const ICostModel*> models;
+  models.reserve(allModels.size());
+  for (const auto* model : allModels) {
+    if (enabled.isEnabled(model->label())) {
+      models.push_back(model);
+    }
+  }
   return models;
 }
 // -------------------------------------------------------------------------------------

@@ -212,14 +212,17 @@ TEST(RandomAccess64, GatherMatchesDecompressOnFullRangeData) {
 // -------------------------------------------------------------------------------------
 // The schemes that ARE supposed to be correct for arbitrary 64-bit data, with
 // no cardinality/range/constant-value precondition: Uncompressed64 trivially,
-// BP64 because its halves-split must handle full-width values, FOR64 because
-// its bias must handle a full-width min, and DynamicDictionary64 because it
-// recurses into the ordinary picker for its (unbounded-width) codes rather
-// than assuming a fixed code width.
+// BP64 because its halves-split must handle full-width values, PFOR64
+// because it's built the same way BP64 is (halves-split, just forcing PFOR
+// on each half instead of auto-picking), FOR64 because its bias must handle
+// a full-width min, and DynamicDictionary64 because it recurses into the
+// ordinary picker for its (unbounded-width) codes rather than assuming a
+// fixed code width.
 TEST(RandomAccess64, FullRangeCorrectness) {
   const auto data = makeFullRange64Data(9000);
   for (const auto type : {Integer64SchemeType::UNCOMPRESSED, Integer64SchemeType::BP,
-                          Integer64SchemeType::FOR, Integer64SchemeType::DICT}) {
+                          Integer64SchemeType::PFOR, Integer64SchemeType::FOR,
+                          Integer64SchemeType::DICT}) {
     auto& scheme = Integer64SchemePicker::MyTypeWrapper::getScheme(CB(type));
     const auto scheme_name = ConvertSchemeTypeToString(type);
     SCOPED_TRACE("scheme = " + scheme_name);

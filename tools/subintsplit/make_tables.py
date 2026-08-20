@@ -40,12 +40,15 @@ CODEC_INFO = {
     "BP": (CODECS, "BP"),
     "BP64": (CODECS, "BP"),
     "PFOR": (CODECS, "PFOR"),
+    "PFOR64": (CODECS, "PFOR"),
     "FOR": (CODECS, "FOR"),
     "FOR64": (CODECS, "FOR"),
     "DICT": (CODECS, "DICT"),
     "DICT64": (CODECS, "DICT"),
     "RLE": (CODECS, "RLE"),
     "RLE64": (CODECS, "RLE"),
+    "FREQUENCY": (CODECS, "Frequency"),
+    "FREQUENCY64": (CODECS, "Frequency"),
     "SIS_HALVES": (CODECS, "SubIntSplit (fixed split)"),
     "SIS64_HALVES": (CODECS, "SubIntSplit (fixed split)"),
     "SIS_PLANNED": (CODECS, "SubIntSplit (planned)"),
@@ -250,6 +253,12 @@ def main() -> None:
         default=1.01,
         help="at or below this ratio a row cannot win a column (default: 1.01)",
     )
+    parser.add_argument(
+        "--regenerate-cmd",
+        default="tools/subintsplit/run_benchmarks.sh",
+        help="command shown in the generated README as how to regenerate these tables"
+        " (default: tools/subintsplit/run_benchmarks.sh)",
+    )
     args = parser.parse_args()
 
     results, sections = load(args.results, args.sections)
@@ -278,7 +287,7 @@ def main() -> None:
         " Do not edit by hand — regenerate with:",
         "",
         "```",
-        "tools/subintsplit/run_benchmarks.sh",
+        args.regenerate_cmd,
         "```",
         "",
         "Each file compares every integer codec on every dataset at one block size. Start with"

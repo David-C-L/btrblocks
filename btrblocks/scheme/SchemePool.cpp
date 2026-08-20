@@ -10,6 +10,7 @@
 #include "scheme/integer64/FOR64.hpp"
 #include "scheme/integer64/Frequency64.hpp"
 #include "scheme/integer64/OneValue64.hpp"
+#include "scheme/integer64/PFOR64.hpp"
 #include "scheme/integer64/RLE64.hpp"
 #include "scheme/integer64/Uncompressed64.hpp"
 // legacy schemes
@@ -94,7 +95,7 @@ SchemesCollection::SchemesCollection() {
     die_if(cfg.integers64.schemes.isEnabled(Integer64SchemeType::ONE_VALUE));
     die_if(cfg.integers64.schemes.isEnabled(Integer64SchemeType::UNCOMPRESSED));
     // optional integer64 schemes -- more are added as later phases port them
-    addIfEnabled<Uncompressed64, OneValue64, BP64, FOR64, RLE64, DynamicDictionary64,
+    addIfEnabled<Uncompressed64, OneValue64, BP64, PFOR64, FOR64, RLE64, DynamicDictionary64,
                  Dictionary8_64, Dictionary16_64, Frequency64, Truncation64,
                  integers::SubIntSplit64>(integer64_schemes, cfg.integers64.schemes);
   }

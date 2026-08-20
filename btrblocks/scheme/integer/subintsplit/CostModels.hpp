@@ -175,9 +175,56 @@ struct RleCostModel : ICostModel {
   IntegerSchemeType label() const override { return IntegerSchemeType::RLE; }
 };
 // -------------------------------------------------------------------------------------
-// The models corresponding to the default enabled scheme set. Returned by
-// value as a stable, shared instance list; callers may supply their own.
-const std::vector<const ICostModel*>& defaultCostModels();
+// PFOR: same range-based bit-width estimate as BitPackingCostModel. SegmentMetrics
+// (see Metrics.hpp) has no outlier-fraction field, so this converges to BP's cost
+// estimate -- it's still a useful distinct label for `predicted` vs `actual`
+// comparison, consistent with this file's philosophy of being directionally
+// correct rather than exact (see top-of-file comment).
+struct PforCostModel : ICostModel {
+  double costBits(const SegmentMetrics& m, std::size_t numValues, int bitWidth) const override {
+    if (numValues == 0) {
+      return 0.0;
+    }
+    // XPBPStructure is tiny (u32_count + padding), but SIMDFastPFor's
+    // patched-exception layout carries its own internal framing/alignment
+    // slack beyond that visible header, so this stays in the same ballpark
+    // as BitPackingCostModel's kHeaderBits rather than XPBPStructure's raw size.
+    constexpr double kHeaderBits = 128.0;
+    const int rangeBits = bitWidthOf(m.range);
+    const int packedBits = std::min(bitWidth, rangeBits);
+    return kHeaderBits + static_cast<double>(packedBits) * static_cast<double>(numValues);
+  }
+  MetricFlags requiredMetrics() const override {
+    return static_cast<MetricFlags>(MetricFlag::MinMax);
+  }
+  IntegerSchemeType label() const override { return IntegerSchemeType::PFOR; }
+};
+// -------------------------------------------------------------------------------------
+// FOR: a bias transform (FORStructure: INTEGER bias + next_scheme byte) that
+// recurses into the picker one level down. Modeled as its common case (BP
+// underneath), with a small header since FORStructure itself is tiny.
+struct ForCostModel : ICostModel {
+  double costBits(const SegmentMetrics& m, std::size_t numValues, int bitWidth) const override {
+    if (numValues == 0) {
+      return 0.0;
+    }
+    constexpr double kHeaderBits = 40.0;
+    const int rangeBits = bitWidthOf(m.range);
+    const int packedBits = std::min(bitWidth, rangeBits);
+    return kHeaderBits + static_cast<double>(packedBits) * static_cast<double>(numValues);
+  }
+  MetricFlags requiredMetrics() const override {
+    return static_cast<MetricFlags>(MetricFlag::MinMax);
+  }
+  IntegerSchemeType label() const override { return IntegerSchemeType::FOR; }
+};
+// -------------------------------------------------------------------------------------
+// The models corresponding to the currently enabled scheme set (filtered
+// against BtrBlocksConfig::get().integers.schemes at each call), so the
+// planner never scores candidates the picker cannot actually choose. Built
+// fresh per call rather than a stable shared instance list, since the
+// enabled set can change at runtime.
+std::vector<const ICostModel*> defaultCostModels();
 // -------------------------------------------------------------------------------------
 inline MetricFlags unionRequiredMetrics(const std::vector<const ICostModel*>& models) {
   MetricFlags flags = static_cast<MetricFlags>(MetricFlag::None);

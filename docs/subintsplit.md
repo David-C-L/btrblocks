@@ -56,9 +56,15 @@ code space (`Integer64SchemeType`, `scheme/SchemeType.hpp`) and its own picker
 it exactly as they do for `INTEGER`. The registered `Integer64SchemeType` set is `UNCOMPRESSED`,
 `ONE_VALUE`, `DICT` (`DynamicDictionary64`), `RLE`, `BP` (splits each value into low/high 32-bit
 halves, each compressed through the ordinary 32-bit picker — the vendored FastPFOR library has no
-native 64-bit bit-packing), `FOR`, `TRUNCATION`, `DICTIONARY_8`/`DICTIONARY_16`, `FREQUENCY`, and
-`SUB_INT_SPLIT`. `FOR`, `TRUNCATION`, `DICTIONARY_8`/`16` and `SUB_INT_SPLIT` are legacy/opt-in, like
-their 32-bit counterparts.
+native 64-bit bit-packing), `PFOR` (`PFOR64` — same low/high halves split as `BP64`, but forces
+`PFOR`/`PBP` specifically on both halves rather than letting the picker choose, so it measures
+patched bit-packing rather than duplicating `BP64`), `FOR`, `TRUNCATION`, `DICTIONARY_8`/`DICTIONARY_16`,
+`FREQUENCY`, and `SUB_INT_SPLIT`. `FOR`, `TRUNCATION`, `DICTIONARY_8`/`16` and `SUB_INT_SPLIT` are
+legacy/opt-in, like their 32-bit counterparts — `PFOR` is not: it was already listed in
+`defaultInteger64Schemes()` before `PFOR64` existed to back it, which made enabling it a silent no-op;
+it is a real registered scheme now. `PFOR64` inherits 32-bit `PBP`'s lack of a mini-block
+`gather`/`lookupAt` override (see *Random-access cost by scheme family* below), per half, so it falls
+back to full-chunk decode there like `PBP` itself does.
 
 This means every `*64` codec — including `SubIntSplit64` — automatically inherits whatever
 random-access capability its composition provides: `BP64`'s `gather` delegates to whichever 32-bit
@@ -212,7 +218,7 @@ supersedes the old blanket claim that nothing but `Uncompressed`/`OneValue` had 
 | `DynamicDictionary`, `DynamicDictionary64` | `O(child code lookup)` | Codes are themselves compressed by a nested scheme (not fixed-width, unlike `Dictionary8/16`), so a lookup costs one child `lookupAt` for the code plus a dictionary-slot read. |
 | `Frequency`, `Frequency64` | `O(1)` typical, `O(log exceptions)` worst case | The dominant value is O(1); an exception position is located via a roaring bitmap's `rank`/`contains`, which is sublinear in the exception count. |
 | `FBP`/`BP` (`FastPFOR`-backed bit-packing), `BP64` | `O(mini-block)` | FastPFOR's fixed-size blocks let a single value be unpacked from one mini-block without decoding the rest of the array — new methods added to the FastPFOR wrapper (`extern/FastPFOR.hpp`/`.cpp`) expose this. `BP64` inherits it automatically: it delegates to whichever 32-bit scheme each half's picker chose. |
-| `PFOR` (`SIMDFastPFor`-backed) | `O(tuple_count)` — no override | Deliberately **not** given mini-block access. `PFOR`'s per-page patched-exception layout (exceptions stored out-of-line, patched back in during a full decode) does not offer the same cheap fixed-block structure `FBP` has; giving it real random access would mean re-deriving which page a row's exception patch belongs to without decoding the page, which is a materially bigger change than the other schemes here needed. Left as a deliberate scope decision rather than attempted and abandoned. |
+| `PFOR` (`SIMDFastPFor`-backed), `PFOR64` | `O(tuple_count)` — no override | Deliberately **not** given mini-block access. `PFOR`'s per-page patched-exception layout (exceptions stored out-of-line, patched back in during a full decode) does not offer the same cheap fixed-block structure `FBP` has; giving it real random access would mean re-deriving which page a row's exception patch belongs to without decoding the page, which is a materially bigger change than the other schemes here needed. Left as a deliberate scope decision rather than attempted and abandoned. `PFOR64` inherits this per half, same as `BP64` inherits `FBP`'s mini-block gather per half — it just inherits the absence instead. |
 | `SubIntSplit`, `SubIntSplit64` | Sum of each section's cost | `gather` delegates per-section to that section's own (now-improved) `gather` rather than decoding the whole value — see `SubIntSplitCore::gather` in `scheme/integer/subintsplit/SubIntSplitCore.hpp`. A lookup costs the sum of each section's own lookup cost, not a full-value decode. This is the change that makes the *Speed* results below possible; the old design decoded every section on every lookup regardless of what each section's own scheme could do. |
 | Everything else | `O(tuple_count + position_count)` for `gather`, `O(tuple_count)` per `lookupAt` | The framework default: decode the chunk into thread-local scratch and index it. |
 
@@ -501,6 +507,92 @@ Clustered traces (1% selectivity, mean run 64) touch 118 of 256 chunks at `block
 of 128 at 8192, so chunk locality is actually exercised. This is why the benchmark reports chunks
 touched next to every gather timing, and why the numbers above use the clustered trace.
 
+## Restricted codec set
+
+`subintsplit_bench` compares SubIntSplit against BtrBlocks' full incumbent pool. A second binary,
+`subintsplit_restricted_bench`, asks a narrower question: how does SubIntSplit compare against, and
+compose with, a deliberately smaller set of five codec families — DynamicDictionary (`DICT`), RLE,
+FBP/PBP/FOR (`BP`/`PFOR`/`FOR`), Uncompressed, and Frequency — rather than everything BtrBlocks can
+register?
+
+The restriction is built from `restrictedIntegerSchemes()`/`restrictedInteger64Schemes()`
+(`scheme/SchemeType.hpp`, next to `defaultIntegerSchemes()`/`defaultInteger64Schemes()`) and applies
+at both levels the question can be asked at:
+
+- **Per-codec forced runs.** `UNCOMPRESSED`, `DICT`, `RLE`, `BP`, `PFOR`, `FOR`, `FREQUENCY` each
+  forced directly, plus `AUTO_BASELINE`/`AUTO_WITH_SIS` (the restricted pool's own automatic selector,
+  with SubIntSplit excluded and included) and `SIS_HALVES`/`SIS_PLANNED`. Symmetric at 64 bits —
+  `PFOR64` existing now (see *64-bit support* above) is what makes that symmetry possible.
+- **SubIntSplit's own per-section sub-codec choice.** Each SubIntSplit section is still handed to the
+  ordinary `IntegerSchemePicker`, which only ever sees whatever `BtrBlocksConfig::get().integers.schemes`
+  currently has enabled — restricted or not, this was already true (see *Selection* above, step 4).
+  What was **not** already true: the DP planner's own cost-model candidates (`CostModels.hpp`,
+  `defaultCostModels()`) used to be a fixed, compile-time list — `{Uncompressed, BitPacking, OneValue,
+  Frequency, Dictionary, RLE}` — with no `PFOR`/`FOR` model at all, and no awareness of what was
+  actually enabled. `defaultCostModels()` now filters its (now eight-model, `PFOR`/`FOR` added)
+  candidate list against `BtrBlocksConfig::get().integers.schemes` on every call, so the planner's
+  *predictions* and the picker's *actual* choices always draw from the identical pool — restricted here,
+  the full default set in `subintsplit_bench`, or anything else a caller configures. Before this fix the
+  two could silently diverge (the planner could "predict" a disabled scheme, or never predict one that
+  was enabled but unmodeled).
+
+**`ONE_VALUE` ("Constant") is not one of the five families and cannot be restricted out.** It is
+required infrastructure, not a benchmark arm: `scheme/SchemePool.cpp`'s `die_if(...)` checks abort at
+startup if it (or `UNCOMPRESSED`) is ever disabled, because two call sites depend on it unconditionally
+and outside the normal enabled/disabled machinery — `SchemePicker.hpp`'s constant-column shortcut and
+`SubIntSplitCore`'s constant-section shortcut both call `getScheme(ONE_VALUE)` directly, with no cost
+comparison and no enabled check. `getScheme()` is an unchecked map lookup; if `ONE_VALUE` were ever
+unregistered, both would dereference a null scheme and segfault rather than fail cleanly. Making it
+safely optional would mean auditing and changing both bypass sites to fall back (e.g. to
+`UNCOMPRESSED`) — out of scope here, and `ONE_VALUE`/Constant was never one of the requested families.
+It stays enabled everywhere, alongside the five.
+
+### Results
+
+Primary dataset is `tweet_ids` — the real column, not the generated snowflake (see *Datasets* above for
+why the generated one is an upper bound, not the number to quote). `subintsplit_restricted_bench`
+enforces this: it requires `--input-i64` by default and refuses to run without it, unless
+`--allow-missing-real-data` is passed (`run_restricted_benchmarks.sh` mirrors this with
+`ALLOW_MISSING_REAL_DATA=1`).
+
+TODO: full-sweep numbers (1,048,576 rows, five repeats, all three block sizes) — regenerate with
+`tools/subintsplit/run_restricted_benchmarks.sh` and replace this table. The figures below are from a
+pipeline-check run only (`QUICK=1`, 262,144 rows, one repeat, `block_size = 65536`) and are directional,
+not final:
+
+| Codec (restricted pool, 64-bit) | Ratio on `tweet_ids` |
+|---|---|
+| `UNCOMPRESSED64` | 1.00 |
+| `DICT64` | 1.00 |
+| `BP64` / `PFOR64` / `FOR64` / `RLE64` / `FREQUENCY64` | 1.07 |
+| `AUTO_BASELINE64` (restricted pool, no SIS) | 1.07 |
+| `SIS64_HALVES` | 1.07 |
+| `SIS64_PLANNED` | ~1.55 |
+| `AUTO_WITH_SIS64` (restricted pool, with SIS) | ~1.55 |
+
+Directionally, this reproduces the same story as the full-pool results above: every restricted-pool
+incumbent lands around the same 1.07× on real data (none of the five families has anything to exploit
+in the near-unique timestamp field on its own), the fixed halves split recovers nothing beyond that
+because Twitter's field boundaries don't land near bit 32, and the planner's chosen boundaries are what
+gets to ~1.55× — consistent with `SIS64_PLANNED` finding two of the three real field boundaries exactly
+(see *The planner recovers the real field layout* above). `AUTO_WITH_SIS64` matching `SIS64_PLANNED`
+confirms the restricted pool's own automatic selector does pick SubIntSplit when it's available, same
+as the full pool does.
+
+### Reproducing
+
+```
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j --target subintsplit_restricted_bench
+tools/subintsplit/run_restricted_benchmarks.sh
+```
+
+Same flags, same CSV schema, same `make_tables.py` rendering as `subintsplit_bench` (see *Reproducing*
+above) — only the candidate pool and the primary-dataset requirement differ. Output lands in
+`benchmark-results-restricted/` by default (`OUT_DIR` to change it); CSVs are named
+`restricted-codecs-results.csv`/`restricted-codecs-sections.csv` so they never collide with
+`subintsplit_bench`'s output when both are run against the same `build/`.
+
 ## Limitations
 
 These are properties of BtrBlocks as it stands, not of the idea, and each points at something worth
@@ -640,11 +732,15 @@ rather than always falling back to `UNCOMPRESSED`.
 | `btrblocks/scheme/integer/SubIntSplit.{hpp,cpp}` | The registered 32-bit scheme |
 | `btrblocks/scheme/integer/SubIntSplit64.{hpp,cpp}` | The registered 64-bit scheme (`Integer64SchemeType::SUB_INT_SPLIT`) |
 | `btrblocks/scheme/CompressionScheme64.hpp/.cpp` | `Integer64Scheme`, the base class every `*64` codec (including `SubIntSplit64`) implements |
-| `btrblocks/scheme/integer64/` | The other registered `Integer64Scheme` codecs: `Uncompressed64`, `OneValue64`, `BP64`, `FOR64`, `RLE64`, `DynamicDictionary64`, `Dictionary8_64`/`16_64`, `Frequency64`, `Truncation64` |
-| `tools/subintsplit/` | Benchmark driver, generators, traces |
+| `btrblocks/scheme/integer64/` | The other registered `Integer64Scheme` codecs: `Uncompressed64`, `OneValue64`, `BP64`, `PFOR64`, `FOR64`, `RLE64`, `DynamicDictionary64`, `Dictionary8_64`/`16_64`, `Frequency64`, `Truncation64` |
+| `btrblocks/scheme/SchemeType.hpp` | `IntegerSchemeType`/`Integer64SchemeType`, `default*Schemes()`, `restrictedIntegerSchemes()`/`restrictedInteger64Schemes()` |
+| `tools/subintsplit/BenchCore.hpp` | Shared benchmark core (`run32`/`run64`, `Result`, CSV writers, timing) — used by both binaries below |
+| `tools/subintsplit/subintsplit_bench.cpp` | Full incumbent codec pool |
+| `tools/subintsplit/restricted_bench.cpp` | Five-family restricted codec pool (see *Restricted codec set* above) |
+| `tools/subintsplit/SnowflakeGen.hpp` / `Traces.hpp` | Generated datasets; gather/point-access position traces |
 | `tools/subintsplit/parquet_to_i64.py` | One-off Parquet → flat int64 conversion for the real dataset |
-| `tools/subintsplit/run_benchmarks.sh` | Runs the sweep and renders the tables |
-| `tools/subintsplit/make_tables.py` | CSVs → the comparison tables in `benchmark-results/` |
+| `tools/subintsplit/run_benchmarks.sh` / `run_restricted_benchmarks.sh` | Run each sweep and render its tables |
+| `tools/subintsplit/make_tables.py` | CSVs → the comparison tables in `benchmark-results/`/`benchmark-results-restricted/` |
 | `test/test-cases/RandomAccess.cpp` / `RandomAccess64.cpp` | Cross-codec gather/lookupAt correctness, 32- and 64-bit |
 | `docs/subintsplit-porting.md` | Deviations from the Nimble original |
 | `docs/subintsplit-results.csv` | Raw output behind the tables above |
