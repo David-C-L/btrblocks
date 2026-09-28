@@ -37,7 +37,10 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <ctime>
 #include <iostream>
+#include <random>
+#include <thread>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -82,6 +85,24 @@ struct SectionRow {
   double share_pct{0.0};  // share of the encoding this section accounts for
 };
 // -------------------------------------------------------------------------------------
+// One row per (codec, range width): what a read of B contiguous elements at a
+// uniformly drawn offset costs.
+//
+// This is the axis the cross-format comparison had no evidence on. It is served
+// through gatherColumn/gatherColumn64, which resolve each position to its own
+// chunk and decode only the chunks the range actually covers -- `chunks_touched`
+// is reported so a reader can check that. A version that decoded the column and
+// sliced it would report the bulk decode path with an extra memcpy and would
+// mean nothing.
+struct RangeRow {
+  uint32_t width_b{0};      // B, elements read per range
+  uint32_t offsets{0};      // distinct start offsets averaged over
+  double range_ms{0.0};     // median wall time for one sweep of all offsets
+  double ns_per_range{0.0};
+  double ns_per_element{0.0};
+  uint32_t chunks_touched{0};  // summed over the offsets in one sweep
+};
+// -------------------------------------------------------------------------------------
 struct Result {
   std::string width;
   std::string dataset;
@@ -106,6 +127,7 @@ struct Result {
   double plan_ms{0.0};
   bool raw_fallback{false};
   std::vector<SectionRow> sections;
+  std::vector<RangeRow> ranges;
 };
 // -------------------------------------------------------------------------------------
 // Turns the encoder's report on the last chunk it compressed into rows.
@@ -275,6 +297,118 @@ class ScopedBoundaries {
   std::unique_ptr<subintsplit::EnforceSplitBoundaries> enforcer_;
 };
 // -------------------------------------------------------------------------------------
+// Range widths swept, and how many start offsets each is averaged over. Both are
+// overridable from the command line so this can be matched to whatever the other
+// harnesses sweep.
+std::vector<uint32_t> g_range_widths{1, 8, 64, 512, 4096, 32768, 262144};
+// Offsets per range width, parallel to g_range_widths.
+//
+// A constant count is the wrong shape. The spread across offsets is not
+// constant in B: it is ~1.03x at B=1, peaks around 7.4x at B=512, and falls
+// back to ~1.6x by B=32768. At the small end almost every offset costs the
+// same (one chunk, one decode) so extra offsets buy nothing; at the large end
+// each offset costs B element-reads, so extra offsets are the most expensive
+// samples in the sweep and the spread does not justify them. Sampling is
+// therefore concentrated in the middle, where the answer actually varies.
+//
+// Against a flat 32 this is 2.6M element-reads per repeat instead of 9.6M --
+// 3.7x less work -- while sampling B=512 harder than the flat schedule did.
+std::vector<uint32_t> g_range_offsets{8, 16, 24, 48, 24, 12, 8};
+// Point probes, aligned across all three harnesses at 256.
+//
+// Alignment means the same count everywhere, and the defensible common count
+// is a small one: for any codec that decodes a block per access the per-probe
+// cost is constant, so a small sample estimates the same ns/probe as a large
+// one. Measured on this benchmark at 64 / 256 / 20,000 probes, ns/probe agrees
+// within 1.17x for every codec and within 1.10x at 256 against 20,000, while
+// the point phase falls from 34% of a run to 1.4%. 64 is measurably biased
+// high (up to 1.17x) because first-touch effects do not amortise over so few
+// probes; 256 removes most of that for nothing.
+uint32_t g_point_probes = 256;
+// Empty means every codec. Otherwise only codecs named here are run.
+std::vector<std::string> g_codec_filter;
+// Range start offsets are drawn from this seed alone, so every codec, dataset
+// and block size reads the same offsets and the columns compare codecs.
+constexpr uint32_t kRangeSeed = 17;
+// -------------------------------------------------------------------------------------
+// Start offsets for one range width, drawn once and reused by every codec, so
+// the columns compare codecs rather than random draws.
+std::vector<uint32_t> rangeStarts(uint32_t row_count, uint32_t width, uint32_t offsets,
+                                  uint32_t seed) {
+  std::vector<uint32_t> starts;
+  if (width > row_count) {
+    return starts;
+  }
+  std::mt19937 rng(seed + width);
+  std::uniform_int_distribution<uint32_t> pick(0, row_count - width);
+  starts.reserve(offsets);
+  for (uint32_t i = 0; i < offsets; i++) {
+    starts.push_back(pick(rng));
+  }
+  return starts;
+}
+// -------------------------------------------------------------------------------------
+// Times one range width. `gather` reads `count` contiguous positions starting at
+// `begin` and reports how many chunks it had to touch.
+template <typename GatherFn>
+void measureRanges(uint32_t row_count, int repeats, uint32_t seed, Result& result,
+                   const GatherFn& gather) {
+  for (std::size_t w = 0; w < g_range_widths.size(); w++) {
+    const uint32_t width = g_range_widths[w];
+    // Falls back to the last entry when the offset schedule is shorter than
+    // the width list, so --range-widths alone stays usable.
+    const uint32_t offsets =
+        g_range_offsets.empty()
+            ? 32
+            : g_range_offsets[std::min(w, g_range_offsets.size() - 1)];
+    const auto starts = rangeStarts(row_count, width, offsets, seed);
+    if (starts.empty()) {
+      continue;
+    }
+    // Positions are materialised outside the timed region: building them is the
+    // caller's cost in a real query, not the format's.
+    std::vector<std::vector<uint32_t>> position_sets;
+    position_sets.reserve(starts.size());
+    for (const uint32_t begin : starts) {
+      std::vector<uint32_t> positions(width);
+      for (uint32_t i = 0; i < width; i++) {
+        positions[i] = begin + i;
+      }
+      position_sets.push_back(std::move(positions));
+    }
+
+    uint32_t touched_total = 0;
+    const double ms = timeMedian(repeats, [&]() {
+      touched_total = 0;
+      for (const auto& positions : position_sets) {
+        touched_total += gather(positions.data(), static_cast<uint32_t>(positions.size()));
+      }
+    });
+
+    RangeRow row;
+    row.width_b = width;
+    row.offsets = static_cast<uint32_t>(starts.size());
+    row.range_ms = ms;
+    row.ns_per_range = ms * 1e6 / static_cast<double>(starts.size());
+    row.ns_per_element = row.ns_per_range / static_cast<double>(width);
+    row.chunks_touched = touched_total;
+    result.ranges.push_back(row);
+  }
+}
+// -------------------------------------------------------------------------------------
+void writeRangeHeader(std::ostream& out) {
+  out << "width,dataset,codec,rows,block_size,B,offsets,range_ms,ns_per_range,ns_per_element,"
+         "chunks_touched\n";
+}
+// -------------------------------------------------------------------------------------
+void writeRangeRows(std::ostream& out, const Result& r) {
+  for (const auto& row : r.ranges) {
+    out << r.width << ',' << r.dataset << ',' << r.codec << ',' << r.rows << ',' << r.block_size
+        << ',' << row.width_b << ',' << row.offsets << ',' << row.range_ms << ','
+        << row.ns_per_range << ',' << row.ns_per_element << ',' << row.chunks_touched << '\n';
+  }
+}
+// -------------------------------------------------------------------------------------
 // ---------------------------- 32-bit arm ----------------------------------------------
 // -------------------------------------------------------------------------------------
 Result run32(const std::string& dataset_name,
@@ -413,7 +547,7 @@ Result run32(const std::string& dataset_name,
                 result.gather_clustered_chunks, result.gather_clustered_rows);
 
   // ---- point access -------------------------------------------------------------
-  const auto point_positions = uniformTrace(rows32, 256, 13);
+  const auto point_positions = uniformTrace(rows32, g_point_probes, 13);
   result.point_count = static_cast<uint32_t>(point_positions.size());
   result.point_ms = timeMedian(repeats, [&]() {
     for (const auto position : point_positions) {
@@ -421,6 +555,17 @@ Result run32(const std::string& dataset_name,
       (void)value;
     }
   });
+
+  // ---- range read ---------------------------------------------------------------
+  {
+    std::vector<INTEGER> range_out(g_range_widths.empty() ? 1 : g_range_widths.back());
+    measureRanges(rows32, repeats, kRangeSeed, result,
+                  [&](const uint32_t* positions, uint32_t count) -> uint32_t {
+                    u32 touched = 0;
+                    reader.gatherColumn(range_out.data(), positions, count, &touched);
+                    return touched;
+                  });
+  }
 
   std::remove(path.c_str());
   return result;
@@ -572,7 +717,7 @@ Result run64(const std::string& dataset_name,
                 result.gather_clustered_chunks, result.gather_clustered_rows);
 
   // ---- point access -------------------------------------------------------------
-  const auto point_positions = uniformTrace(rows64, 256, 13);
+  const auto point_positions = uniformTrace(rows64, g_point_probes, 13);
   result.point_count = static_cast<uint32_t>(point_positions.size());
   result.point_ms = timeMedian(repeats, [&]() {
     for (const auto position : point_positions) {
@@ -580,6 +725,18 @@ Result run64(const std::string& dataset_name,
       (void)value;
     }
   });
+
+  // ---- range read ---------------------------------------------------------------
+  // B contiguous elements from a uniformly drawn offset, at log-spaced B.
+  {
+    std::vector<s64> range_out(g_range_widths.empty() ? 1 : g_range_widths.back());
+    measureRanges(rows64, repeats, kRangeSeed, result,
+                  [&](const uint32_t* positions, uint32_t count) -> uint32_t {
+                    u32 touched = 0;
+                    reader.gatherColumn64(range_out.data(), positions, count, &touched);
+                    return touched;
+                  });
+  }
 
   std::remove(path.c_str());
   return result;
@@ -623,6 +780,138 @@ std::vector<s64> readInt64Column(const std::string& path, uint32_t max_count) {
   return values;
 }
 // -------------------------------------------------------------------------------------
+// Reads a one-value-per-line text column, the format the shared corpus under
+// EncodingsPlayground/Datasets is dumped in and the same input the Nimble ML-ID
+// benchmark reads through --mlidc_file. Taking the LEADING max_count values in
+// file order is the rule all three harnesses now follow, so the three encode the
+// same rows in the same arrangement.
+//
+// Returns empty on any failure: a missing dataset should cost the caller one
+// column, not a whole sweep.
+std::vector<s64> readTextColumn(const std::string& path, uint32_t max_count) {
+  std::ifstream in(path);
+  if (!in.good()) {
+    return {};
+  }
+  std::vector<s64> values;
+  values.reserve(max_count);
+  std::string line;
+  while (values.size() < max_count && std::getline(in, line)) {
+    if (line.empty()) {
+      continue;
+    }
+    try {
+      values.push_back(static_cast<s64>(std::stoll(line)));
+    } catch (const std::exception&) {
+      std::cerr << "note: " << path << " has an unparseable line, stopping there\n";
+      break;
+    }
+  }
+  if (values.size() < max_count) {
+    std::cerr << "note: " << path << " holds " << values.size()
+              << " values, fewer than the requested " << max_count << "\n";
+  }
+  return values;
+}
+// -------------------------------------------------------------------------------------
+// A `name=path` dataset argument. Repeating --dataset is how a column other than
+// the built-in generated ones gets measured, which is what the XMark, OSM and
+// Public BI columns need.
+bool parseNamedDataset(const std::string& text, std::string& name, std::string& file) {
+  const auto equals = text.find('=');
+  if (equals == std::string::npos || equals == 0 || equals + 1 == text.size()) {
+    return false;
+  }
+  name = text.substr(0, equals);
+  file = text.substr(equals + 1);
+  return true;
+}
+// -------------------------------------------------------------------------------------
+// Records what machine produced a run.
+//
+// No result file in this repository carried this, which makes any timing here
+// uncomparable to a timing produced anywhere else -- including to this same
+// benchmark on this same machine under a different governor.
+void writeRunMetadata(const std::string& path, int repeats, uint32_t rows) {
+  std::ofstream out(path);
+  if (!out.good()) {
+    std::cerr << "cannot open " << path << " for run metadata\n";
+    return;
+  }
+  const auto readFirst = [](const char* file, const char* prefix) -> std::string {
+    std::ifstream in(file);
+    std::string line;
+    const std::string want(prefix);
+    while (std::getline(in, line)) {
+      if (want.empty()) {
+        return line;
+      }
+      if (line.rfind(want, 0) == 0) {
+        const auto colon = line.find(':');
+        if (colon == std::string::npos) {
+          return {};
+        }
+        const auto first = line.find_first_not_of(" \t", colon + 1);
+        return first == std::string::npos ? std::string() : line.substr(first);
+      }
+    }
+    return {};
+  };
+
+  const auto now = std::time(nullptr);
+  char stamp[32] = {};
+  std::strftime(stamp, sizeof(stamp), "%Y-%m-%dT%H:%M:%S", std::gmtime(&now));
+
+  out << "key,value\n";
+  out << "driver,subintsplit_bench\n";
+  out << "timestamp_utc," << stamp << "\n";
+  out << "cpu_model," << readFirst("/proc/cpuinfo", "model name") << "\n";
+  out << "hardware_threads," << std::thread::hardware_concurrency() << "\n";
+  out << "scaling_governor,"
+      << readFirst("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor", "") << "\n";
+#if defined(__clang__)
+  out << "compiler,clang " << __clang_major__ << "." << __clang_minor__ << "\n";
+#elif defined(__GNUC__)
+  out << "compiler,gcc " << __GNUC__ << "." << __GNUC_MINOR__ << "\n";
+#else
+  out << "compiler,unknown\n";
+#endif
+  out << "reduction,median_of_" << repeats << "\n";
+  out << "rows," << rows << "\n";
+  out << "point_probes," << g_point_probes << "\n";
+  out << "range_offsets_per_width,";
+  for (std::size_t i = 0; i < g_range_offsets.size(); i++) {
+    out << (i ? " " : "") << g_range_offsets[i];
+  }
+  out << "\n";
+  out << "range_widths,";
+  for (std::size_t i = 0; i < g_range_widths.size(); i++) {
+    out << (i ? " " : "") << g_range_widths[i];
+  }
+  out << "\n";
+  out << "codec_set," << (g_codec_filter.empty() ? "all" : "restricted") << "\n";
+  out << "range_seed," << kRangeSeed << "\n";
+}
+// -------------------------------------------------------------------------------------
+std::vector<std::string> parseStringList(const std::string& text) {
+  std::vector<std::string> values;
+  std::stringstream stream(text);
+  std::string token;
+  while (std::getline(stream, token, ',')) {
+    if (!token.empty()) {
+      values.push_back(token);
+    }
+  }
+  return values;
+}
+// -------------------------------------------------------------------------------------
+bool codecSelected(const std::string& name) {
+  if (g_codec_filter.empty()) {
+    return true;
+  }
+  return std::find(g_codec_filter.begin(), g_codec_filter.end(), name) != g_codec_filter.end();
+}
+// -------------------------------------------------------------------------------------
 std::vector<uint32_t> parseUintList(const std::string& text) {
   std::vector<uint32_t> values;
   std::stringstream stream(text);
@@ -645,6 +934,10 @@ int main(int argc, char** argv) {
   std::string csv_path;
   std::string sections_csv_path;
   std::string input_i64;
+  std::string range_csv_path;
+  std::string metadata_path;
+  // Named text columns from the shared corpus, in the order they were given.
+  std::vector<std::pair<std::string, std::string>> named_datasets;
 
   for (int i = 1; i < argc; i++) {
     const std::string arg = argv[i];
@@ -663,18 +956,67 @@ int main(int argc, char** argv) {
       input_i64 = next();
     } else if (arg == "--sections-csv") {
       sections_csv_path = next();
+    } else if (arg == "--range-csv") {
+      range_csv_path = next();
+    } else if (arg == "--metadata-csv") {
+      metadata_path = next();
+    } else if (arg == "--range-widths") {
+      g_range_widths = parseUintList(next());
+    } else if (arg == "--range-offsets") {
+      g_range_offsets = parseUintList(next());
+    } else if (arg == "--codecs") {
+      const std::string value = next();
+      if (value == "common") {
+        // The set every one of the three frameworks implements, and the only
+        // set the cross-format figure plots. Anything outside it is
+        // measurement that will not be used, and at these row counts the
+        // range sweep makes unused measurement expensive.
+        g_codec_filter = {"UNCOMPRESSED64", "FOR64",      "PFOR64",       "DICT64",
+                          "RLE64",          "FREQUENCY64", "SIS64_PLANNED"};
+      } else {
+        g_codec_filter = parseStringList(value);
+      }
+    } else if (arg == "--point-probes") {
+      g_point_probes = static_cast<uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
+    } else if (arg == "--dataset") {
+      std::string name;
+      std::string file;
+      if (!parseNamedDataset(next(), name, file)) {
+        std::cerr << "--dataset expects name=path\n";
+        return 1;
+      }
+      named_datasets.emplace_back(std::move(name), std::move(file));
     } else if (arg == "--help") {
       std::cout << "usage: subintsplit_bench [--rows N] [--block-sizes a,b,c] [--repeats N]\n"
                    "                         [--seed N] [--csv PATH] [--input-i64 PATH]\n"
-                   "                         [--sections-csv PATH]\n"
+                   "                         [--dataset NAME=PATH]... [--sections-csv PATH]\n"
+                   "                         [--range-csv PATH] [--metadata-csv PATH]\n"
+                   "                         [--range-widths a,b,c] [--range-offsets N]\n"
+                   "                         [--point-probes N]\n"
                    "\n"
                    "  --input-i64 PATH     add a 64-bit dataset read from a flat little-endian\n"
                    "                       int64 file, for measuring against real data rather\n"
                    "                       than generated. Produce one with parquet_to_i64.py.\n"
                    "\n"
+                   "  --dataset NAME=PATH  add a 64-bit dataset read from a one-value-per-line\n"
+                   "                       text file, the format the shared column corpus is\n"
+                   "                       dumped in. Repeatable. The LEADING --rows values are\n"
+                   "                       taken in file order, which is the rule the FastLanes\n"
+                   "                       and Nimble harnesses follow, so all three encode the\n"
+                   "                       same rows in the same arrangement.\n"
+                   "\n"
                    "  --sections-csv PATH  write one row per section of each SubIntSplit plan:\n"
                    "                       bit range, the scheme the planner predicted, the\n"
-                   "                       scheme actually chosen, and the bytes it cost.\n";
+                   "                       scheme actually chosen, and the bytes it cost.\n"
+                   "\n"
+                   "  --range-csv PATH     write the range-read sweep: the cost of reading B\n"
+                   "                       contiguous elements from a uniformly drawn offset,\n"
+                   "                       for each B in --range-widths, together with how many\n"
+                   "                       chunks the read had to touch.\n"
+                   "\n"
+                   "  --metadata-csv PATH  write the CPU, compiler, governor and sweep settings\n"
+                   "                       this run used. Without it a timing here cannot be\n"
+                   "                       compared to a timing from anywhere else.\n";
       return 0;
     } else {
       std::cerr << "unknown argument: " << arg << "\n";
@@ -691,6 +1033,8 @@ int main(int argc, char** argv) {
     // its 32-bit counterpart), but the FOR64 codec below forces it directly,
     // so it has to be in the pool for the override to find.
     config.integers64.schemes.enable(Integer64SchemeType::FOR);
+    config.integers64.schemes.enable(Integer64SchemeType::PFOR);
+    config.integers64.schemes.enable(Integer64SchemeType::FREQUENCY);
   });
 
   // The incumbent codecs, then SubIntSplit with the planner's split and with
@@ -721,6 +1065,12 @@ int main(int argc, char** argv) {
       {"FOR64", Integer64SchemeType::FOR, false, ""},
       {"RLE64", Integer64SchemeType::RLE, false, ""},
       {"DICT64", Integer64SchemeType::DICT, false, ""},
+      // Patched FOR and top-value-plus-exceptions. Both are registered
+      // Integer64Schemes but were missing from this list, which is why they
+      // existed only in a separate restricted-pool run. Both are in the
+      // cross-format common set, so they belong here.
+      {"PFOR64", Integer64SchemeType::PFOR, false, ""},
+      {"FREQUENCY64", Integer64SchemeType::FREQUENCY, false, ""},
       // What BtrBlocks does today, with SubIntSplit out of the pool.
       {"AUTO_BASELINE64", Integer64SchemeType::UNCOMPRESSED, true, "", true},
       // And with it in, which also shows whether the picker actually selects it.
@@ -763,6 +1113,19 @@ int main(int argc, char** argv) {
     }
   }
 
+  // Named columns from the shared corpus: XMark, OSM, Public BI, and Snowflake
+  // itself when it is supplied this way rather than through --input-i64. Adding
+  // a column to the cross-format comparison is a --dataset argument, not a code
+  // change.
+  for (const auto& [name, file_path] : named_datasets) {
+    auto values = readTextColumn(file_path, rows);
+    if (values.empty()) {
+      std::cerr << "warning: could not read " << file_path << ", skipping dataset " << name << "\n";
+      continue;
+    }
+    datasets64.push_back({name, std::move(values)});
+  }
+
   std::ofstream file;
   if (!csv_path.empty()) {
     file.open(csv_path);
@@ -783,22 +1146,66 @@ int main(int argc, char** argv) {
     }
     writeSectionsHeader(sections_file);
   }
+  std::ofstream range_file;
+  if (!range_csv_path.empty()) {
+    range_file.open(range_csv_path);
+    if (!range_file.good()) {
+      std::cerr << "cannot open " << range_csv_path << "\n";
+      return 1;
+    }
+    writeRangeHeader(range_file);
+  }
   const auto emit = [&](const Result& result) {
     writeCsvRow(csv, result);
     if (sections_file.is_open()) {
       writeSectionRows(sections_file, result);
     }
+    if (range_file.is_open()) {
+      writeRangeRows(range_file, result);
+    }
   };
+
+  if (!metadata_path.empty()) {
+    writeRunMetadata(metadata_path, repeats, rows);
+  }
+
+  // The `common` preset names 64-bit codecs only, so a run using it encodes
+  // nothing at 32 bits. That is correct for the cross-format comparison, whose
+  // columns are all read as int64, but silent zero output is exactly the kind
+  // of thing that gets mistaken for a broken build.
+  if (!g_codec_filter.empty()) {
+    const auto selected = [&](const auto& codecs) {
+      std::size_t count = 0;
+      for (const auto& codec : codecs) {
+        count += codecSelected(codec.name) ? 1 : 0;
+      }
+      return count;
+    };
+    if (selected(codecs32) == 0) {
+      std::cerr << "note: no 32-bit codec matches --codecs, so the 32-bit arm will "
+                   "produce no rows\n";
+    }
+    if (selected(codecs64) == 0) {
+      std::cerr << "note: no 64-bit codec matches --codecs, so the 64-bit arm will "
+                   "produce no rows\n";
+    }
+  }
 
   for (const auto block_size : block_sizes) {
     for (const auto& dataset : datasets32) {
       for (const auto& codec : codecs32) {
+        if (!codecSelected(codec.name)) {
+          continue;
+        }
         std::cerr << "32/" << dataset.name << "/" << codec.name << " @" << block_size << "\n";
         emit(run32(dataset.name, dataset.data, codec, block_size, repeats));
       }
     }
     for (const auto& dataset : datasets64) {
       for (const auto& codec : codecs64) {
+        if (!codecSelected(codec.name)) {
+          continue;
+        }
         std::cerr << "64/" << dataset.name << "/" << codec.name << " @" << block_size << "\n";
         emit(run64(dataset.name, dataset.data, codec, block_size, repeats));
       }
@@ -806,6 +1213,9 @@ int main(int argc, char** argv) {
     csv.flush();
     if (sections_file.is_open()) {
       sections_file.flush();
+    }
+    if (range_file.is_open()) {
+      range_file.flush();
     }
   }
 
