@@ -229,6 +229,34 @@ TEST(RandomAccess, GatherColumnMatchesReadColumn) {
   BtrBlocksConfig::get().block_size = saved_block_size;
 }
 // -------------------------------------------------------------------------------------
+// Frequency resolves an exception's index with a Roaring rank. With more than
+// 4096 exceptions the bitmap is a bitset container, whose rank the vendored
+// CRoaring gets wrong for positions that are 63 mod 64; every such exception
+// used to come back as the next exception's value.
+TEST(RandomAccess, FrequencyGatherWithDenseExceptions) {
+  std::mt19937 gen(3);
+  std::vector<INTEGER> data(20000);
+  for (auto& value : data) {
+    value = (gen() % 10 < 6) ? 0 : static_cast<INTEGER>(1 + gen() % 500);
+  }
+  auto& scheme = IntegerSchemePicker::MyTypeWrapper::getScheme(IntegerSchemeType::FREQUENCY);
+  const auto tuple_count = static_cast<u32>(data.size());
+  auto stats = SInteger32Stats::generateStats(data.data(), nullptr, tuple_count);
+  auto compressed = makeBytesArray(tuple_count * sizeof(INTEGER) * 10 + 4096);
+  scheme.compress(data.data(), nullptr, compressed.get(), stats, 3);
+
+  std::vector<u32> positions;
+  for (u32 row = 63; row < tuple_count; row += 64) {
+    positions.push_back(row);
+  }
+  std::vector<INTEGER> gathered(positions.size());
+  scheme.gather(gathered.data(), compressed.get(), nullptr, tuple_count, positions.data(),
+                static_cast<u32>(positions.size()), 0);
+  for (std::size_t i = 0; i < positions.size(); i++) {
+    ASSERT_EQ(gathered[i], data[positions[i]]) << "row " << positions[i];
+  }
+}
+// -------------------------------------------------------------------------------------
 TEST(RandomAccess, End) {
   BtrBlocksConfig::get().integers.schemes = defaultIntegerSchemes();
   SchemePool::refresh();

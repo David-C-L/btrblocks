@@ -43,6 +43,18 @@ void Frequency::decompress(INTEGER* dest,
 // -------------------------------------------------------------------------------------
 namespace {
 thread_local std::vector<std::vector<INTEGER>> frequency_exceptions_scratch;
+// 0-based index of `position` among the exceptions, for a position known to be
+// one. That is rank(position) - 1, but the vendored CRoaring (b88b002) gets
+// bitset-container rank wrong when position % 64 == 63: its word loop already
+// covers that word, then it adds the popcount of the *next* word as well. For
+// a member, rank(position) - 1 == rank(position - 1), and position - 1 is then
+// 62 mod 64, so ask for whichever of the two avoids the bad case.
+u32 exceptionIndex(const Roaring& exceptions, u32 position) {
+  if (position % 64 == 63) {
+    return static_cast<u32>(exceptions.rank(position - 1));
+  }
+  return static_cast<u32>(exceptions.rank(position) - 1);
+}
 }  // namespace
 // -------------------------------------------------------------------------------------
 void Frequency::gather(INTEGER* dest,
@@ -73,8 +85,7 @@ void Frequency::gather(INTEGER* dest,
   std::vector<u32> exception_slots;
   for (u32 i = 0; i < position_count; i++) {
     if (exceptions_bitmap.contains(positions[i])) {
-      // rank(x) counts values <= x, so the 0-based exception index is rank-1.
-      exception_ranks.push_back(static_cast<u32>(exceptions_bitmap.rank(positions[i]) - 1));
+      exception_ranks.push_back(exceptionIndex(exceptions_bitmap, positions[i]));
       exception_slots.push_back(i);
     } else {
       dest[i] = col_struct.top_value;
