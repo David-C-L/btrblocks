@@ -6,8 +6,8 @@
 // /gather/lookupAt) rather than through Relation/Datablock, so they can
 // inspect the encoded buffer's header/section layout directly (section
 // count, chosen scheme codes, forced-boundary description) the way the
-// higher-level pipeline doesn't expose. Sections are still compressed by the
-// ordinary 32-bit scheme pool, which is the point of the design.
+// higher-level pipeline doesn't expose. Sections of at most 32 bits are
+// compressed by the ordinary 32-bit scheme pool, wider ones by the 64-bit pool.
 // -------------------------------------------------------------------------------------
 #include "TestHelper.hpp"
 // -------------------------------------------------------------------------------------
@@ -154,11 +154,11 @@ TEST(SubIntSplit64, TerminatesAtEveryCascadeDepth) {
   }
 }
 // -------------------------------------------------------------------------------------
-// Every section must be at most 32 bits, since a section is handed to the
-// 32-bit scheme picker, and none may be SubIntSplit itself. The 64-bit path is
-// where the nesting guard matters most: it is free-standing, so it always
-// starts at the shallowest cascade depth.
-TEST(SubIntSplit64, SectionsFitTheThirtyTwoBitPool) {
+// A section of at most 32 bits goes to the 32-bit scheme picker and a wider
+// one to the 64-bit picker, flagged in its descriptor; none may be SubIntSplit
+// itself. The 64-bit path is where the nesting guard matters most: it is
+// free-standing, so it always starts at the shallowest cascade depth.
+TEST(SubIntSplit64, SectionsFitTheirPool) {
   const auto data = makeSnowflake64(16384);
   const auto tuple_count = static_cast<u32>(data.size());
   auto compressed = makeBytesArray(SubIntSplit64::maxCompressedSize(tuple_count));
@@ -176,10 +176,78 @@ TEST(SubIntSplit64, SectionsFitTheThirtyTwoBitPool) {
 
   for (u8 s = 0; s < header->section_count; s++) {
     const int width = descriptors[s].bit_end - descriptors[s].bit_start + 1;
-    ASSERT_LE(width, 32) << "section " << static_cast<int>(s) << " is too wide for the pool";
-    ASSERT_NE(descriptors[s].scheme_code, CB(IntegerSchemeType::SUB_INT_SPLIT))
+    const bool wide = (descriptors[s].flags & kSectionWide) != 0;
+    ASSERT_EQ(wide, width > narrowSectionMaxBits())
+        << "section " << static_cast<int>(s) << " went to the wrong pool";
+    const u8 sis_code =
+        wide ? CB(Integer64SchemeType::SUB_INT_SPLIT) : CB(IntegerSchemeType::SUB_INT_SPLIT);
+    ASSERT_NE(descriptors[s].scheme_code, sis_code)
         << "section " << static_cast<int>(s) << " recursed into SubIntSplit";
   }
+}
+// -------------------------------------------------------------------------------------
+// A 40-bit field drawn from 64 distinct values, under a slowly changing 24-bit
+// field. The 40-bit field is best kept whole: one dictionary with 6-bit codes,
+// where any cut at or below bit 32 pays for the codes twice (the two halves are
+// correlated, so each keeps all 64 values). The 32-bit section cap forbade
+// that; wide sections go to the 64-bit pool, so the planner must now choose a
+// section wider than 32 bits, and it must round-trip through decode and gather.
+TEST(SubIntSplit64, WideSectionChosenAndRoundTrips) {
+  std::mt19937_64 gen(5);
+  std::vector<uint64_t> alphabet(64);
+  for (auto& symbol : alphabet) {
+    symbol = (gen() & ((uint64_t{1} << 40) - 1)) | (uint64_t{1} << 39);
+  }
+  std::vector<s64> data(32768);
+  for (std::size_t i = 0; i < data.size(); i++) {
+    const uint64_t high = i / 1000;
+    data[i] = static_cast<s64>((high << 40) | alphabet[gen() % alphabet.size()]);
+  }
+  const auto tuple_count = static_cast<u32>(data.size());
+
+  roundTrip64(data);
+
+  auto compressed = makeBytesArray(SubIntSplit64::maxCompressedSize(tuple_count));
+  SubIntSplit64 scheme;
+  SInteger64Stats stats = SInteger64Stats::generateStats(data.data(), nullptr, tuple_count);
+  const u32 size = scheme.compress(data.data(), nullptr, compressed.get(), stats, 3);
+
+  const auto* header = reinterpret_cast<const SubIntSplitHeader*>(compressed.get());
+  const auto* descriptors = reinterpret_cast<const SectionDescriptor*>(header->data);
+  int widest = 0;
+  bool wide_flagged = false;
+  for (u8 s = 0; s < header->section_count; s++) {
+    const int width = descriptors[s].bit_end - descriptors[s].bit_start + 1;
+    if (width > widest) {
+      widest = width;
+      wide_flagged = (descriptors[s].flags & kSectionWide) != 0;
+    }
+  }
+  ASSERT_GT(widest, 32) << scheme.fullDescription(compressed.get());
+  ASSERT_TRUE(wide_flagged) << "a section wider than 32 bits must use the 64-bit pool";
+
+  std::mt19937 pick(41);
+  std::vector<u32> positions(1024);
+  for (auto& position : positions) {
+    position = pick() % tuple_count;
+  }
+  std::vector<s64> gathered(positions.size());
+  scheme.gather(gathered.data(), compressed.get(), nullptr, tuple_count, positions.data(),
+               static_cast<u32>(positions.size()), 0);
+  for (std::size_t i = 0; i < positions.size(); i++) {
+    ASSERT_EQ(gathered[i], data[positions[i]]) << "row " << positions[i];
+  }
+
+  // And it must beat the old cap, which had to cut the field at bit 32.
+  u32 capped_size = 0;
+  {
+    auto& tuning = SchemeConfig::get().integers.subintsplit;
+    const auto saved = tuning.max_section_bits;
+    tuning.max_section_bits = 32;
+    capped_size = roundTrip64(data);
+    tuning.max_section_bits = saved;
+  }
+  ASSERT_LT(size, capped_size) << "wide " << size << " vs 32-bit cap " << capped_size;
 }
 // -------------------------------------------------------------------------------------
 // Data encoded at one width must not be decodable at the other. Both widths

@@ -52,6 +52,10 @@ struct SectionReport {
   // ...against what the picker actually chose. Divergence is the signal that
   // the cost models are mis-modelling something.
   IntegerSchemeType actual{IntegerSchemeType::UNCOMPRESSED};
+  // A section wider than the 32-bit pool accepts was compressed by the 64-bit
+  // picker; its choice is then in `actual64` and `actual` is meaningless.
+  bool wide{false};
+  Integer64SchemeType actual64{Integer64SchemeType::UNCOMPRESSED};
   u32 bytes{0};
 };
 // -------------------------------------------------------------------------------------
@@ -77,26 +81,43 @@ inline PlanReport& lastPlanReport() {
   return report;
 }
 // -------------------------------------------------------------------------------------
-// Widest section the sub-scheme pool can safely handle.
+// Widest section the 32-bit sub-scheme pool can safely handle.
 //
-// A section is handed to the ordinary integer scheme picker as INTEGER, so 32
-// is the ceiling. 32 is also the right default: the default schemes are all
-// bit-exact on arbitrary 32-bit patterns, including ones with the sign bit set
-// (UNCOMPRESSED and ONE_VALUE copy raw bytes, BP/PFOR reinterpret to unsigned
-// for FastPFor, DICT's ordering is self-consistent, RLE only compares equality).
+// A narrow section is handed to the ordinary integer scheme picker as INTEGER,
+// so 32 is the ceiling. 32 is also the right default: the default schemes are
+// all bit-exact on arbitrary 32-bit patterns, including ones with the sign bit
+// set (UNCOMPRESSED and ONE_VALUE copy raw bytes, BP/PFOR reinterpret to
+// unsigned for FastPFor, DICT's ordering is self-consistent, RLE only compares
+// equality).
 //
 // FOR and the truncation schemes are the exceptions: they do signed arithmetic
 // on the value (`src[i] - stats.min`), which overflows for a full-width section.
 // So the cap drops to 31 whenever one of those is enabled, which keeps every
 // section value non-negative. This is derived from the enabled set rather than
 // from a build flag because the schemes are enabled at runtime.
-inline int effectiveMaxSectionBits() {
+//
+// For a 64-bit column a section wider than this is not forbidden: it is
+// extracted as BIGINT and compressed by the 64-bit picker instead (see
+// SubIntSplitCore::encode), and priced at 64 bits of storage by the planner.
+inline int narrowSectionMaxBits() {
   const auto& schemes = BtrBlocksConfig::get().integers.schemes;
   const bool signSensitive = schemes.isEnabled(IntegerSchemeType::FOR) ||
                              schemes.isEnabled(IntegerSchemeType::TRUNCATION_8) ||
                              schemes.isEnabled(IntegerSchemeType::TRUNCATION_16);
+  return signSensitive ? 31 : 32;
+}
+// -------------------------------------------------------------------------------------
+// Widest section the planner may choose for a `valueBits`-wide column.
+//
+// A 32-bit column only ever uses the 32-bit pool, so its sections stay within
+// narrowSectionMaxBits(). A 64-bit column may also use the 64-bit pool, so its
+// sections go up to the full 64 bits (a 33-40-bit timestamp field can stay
+// whole, as in Nimble). The configured max_section_bits caps both; setting it
+// to 32 restores the old 32-bit cap for 64-bit columns.
+inline int effectiveMaxSectionBits(int valueBits = 32) {
   const int configured = SchemeConfig::get().integers.subintsplit.max_section_bits;
-  return std::min(configured, signSensitive ? 31 : 32);
+  const int ceiling = valueBits > 32 ? valueBits : narrowSectionMaxBits();
+  return std::min(configured, ceiling);
 }
 // -------------------------------------------------------------------------------------
 // "0-20;21-40;41-63" -- inclusive ranges, ascending, contiguous, covering

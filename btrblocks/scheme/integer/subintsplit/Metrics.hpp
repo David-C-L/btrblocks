@@ -50,6 +50,13 @@ struct SegmentMetrics {
 
   std::size_t runCount{0};
   double avgRunLength{0.0};
+
+  // Bits one value of this range occupies before its sub-scheme runs: 32 for a
+  // section handed to the 32-bit scheme picker, 64 for one wider than that
+  // picker accepts, which goes to the 64-bit picker instead. Not computed from
+  // the values; the planner sets it from the range's width, so the cost models
+  // price each section at the storage width it will actually be encoded at.
+  int storageBits{32};
 };
 // -------------------------------------------------------------------------------------
 // Single-pass collector over the values of one extracted bit range.

@@ -67,8 +67,10 @@ it. Ported verbatim, every cost model would charge 8 bits per value for a 1-bit 
 floor is 32 — and since the error grows as sections get narrower, the planner would systematically
 over-split.
 
-`kSectionStorageBits` is therefore a constant 32. This is a correctness fix for this framework, not a
-simplification, and it must not be "corrected back" during a re-sync.
+`kSectionStorageBits` is therefore a constant 32 for sections handed to the 32-bit picker, and
+`kWideSectionStorageBits` (64) for wide sections of a 64-bit column, which go to the 64-bit picker;
+the planner records which applies in `SegmentMetrics::storageBits`. This is a correctness fix for
+this framework, not a simplification, and it must not be "corrected back" to 8/16 during a re-sync.
 
 The underlying limitation is worth fixing upstream in BtrBlocks rather than worked around here: a
 sub-stream interface parameterised on width would recover both the ratio (dictionary entries and RLE
@@ -110,21 +112,27 @@ scheme is chosen independently by the picker at encode time. Nimble does the sam
 `SegmentPlan::encoding` is computed and then discarded. Keeping the prediction lets the two be
 compared, which is a useful check on the cost models.
 
-### 6. Section width cap (new)
+### 6. Section width cap (changed)
 
-Nimble has no equivalent: its sections can be any width up to the value width. Here a section must
-fit `IntegerSchemePicker`, so it cannot exceed 32 bits.
+Nimble has no cap: its sections can be any width up to the value width. Here a section that goes to
+`IntegerSchemePicker` must fit `INTEGER`, so for a 32-bit column sections cannot exceed 32 bits. For a
+64-bit column a wider section is extracted as `BIGINT` and compressed by `Integer64SchemePicker`
+instead (flagged `kSectionWide` in its descriptor, format version 2), so sections go up to 64 bits as
+in Nimble. The planner prices such a section at 64 bits of storage (`SegmentMetrics::storageBits`,
+set from the width in `selectSplits`).
 
-The cap is derived at plan time from the *enabled scheme set* rather than being a constant, because
-32 is only safe when no sign-sensitive sub-scheme is enabled. `FOR` and `Truncation8/16` do signed
-arithmetic on the value (`src[i] - stats.min`), which overflows for a full-width section, so the cap
-drops to 31 when any of them is on. See `effectiveMaxSectionBits()` in `Plan.hpp`.
+The 32-bit pool's ceiling is derived at plan time from the *enabled scheme set* rather than being a
+constant, because 32 is only safe when no sign-sensitive sub-scheme is enabled. `FOR` and
+`Truncation8/16` do signed arithmetic on the value (`src[i] - stats.min`), which overflows for a
+full-width section, so the ceiling drops to 31 when any of them is on, and a 32-bit-wide section of
+a 64-bit column then goes to the 64-bit pool. See `narrowSectionMaxBits()` and
+`effectiveMaxSectionBits()` in `Plan.hpp`.
 
 This is not hypothetical: CI builds a matrix that includes `-DENABLE_FOR_SCHEME=ON`.
 
-Keeping the default at 32 also matters for the benchmark — it makes the fixed halves split a
-representable point in the planner's own search space, so the control arm is a true ablation rather
-than a comparison against something the planner was forbidden to choose.
+The fixed halves split stays a representable point in the planner's own search space, so the control
+arm is a true ablation rather than a comparison against something the planner was forbidden to
+choose. `max_section_bits = 32` restores the old 32-bit cap for 64-bit columns.
 
 ### 7. Section count cap (new)
 
@@ -150,8 +158,10 @@ schemes do, and safe because `Chunk::operator==` only compares rows the bitmap m
 ### 9. Fallback plan (changed)
 
 Nimble's selector, when the DP finds nothing finite, emits a single segment covering the whole value.
-That is illegal here for a 64-bit value, since sections cap at 32 bits. The fallback instead slices
-the value at the maximum section width, which always yields a legal plan.
+That is legal here too for a 64-bit value now that wide sections exist, but not for a 32-bit value
+when the section ceiling is 31, or when `max_section_bits` is lowered. The fallback therefore slices
+the value at the maximum section width, which always yields a legal plan (one section when the cap
+allows it).
 
 ## Things deliberately not ported
 

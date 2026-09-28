@@ -22,11 +22,12 @@ const std::vector<const ICostModel*>& defaultCostModels() {
   return models;
 }
 // -------------------------------------------------------------------------------------
-SelectorConfig defaultSelectorConfig() {
+SelectorConfig defaultSelectorConfig(int valueBits) {
   const auto& tuning = SchemeConfig::get().integers.subintsplit;
   SelectorConfig cfg;
   cfg.minSectionBits = tuning.min_section_bits;
-  cfg.maxSectionBits = effectiveMaxSectionBits();
+  cfg.maxSectionBits = effectiveMaxSectionBits(valueBits);
+  cfg.narrowSectionBits = narrowSectionMaxBits();
   cfg.maxSections = tuning.max_sections;
   cfg.splitPenalty = tuning.split_penalty;
   return cfg;
@@ -141,7 +142,9 @@ SplitPlan selectSplits(const std::vector<uint64_t>& samples,
       if (width < minWidth) {
         continue;
       }
-      const auto metrics = collector.compute(extractor.values(), width, required);
+      auto metrics = collector.compute(extractor.values(), width, required);
+      metrics.storageBits =
+          width > cfg.narrowSectionBits ? kWideSectionStorageBits : kSectionStorageBits;
       IntegerSchemeType scheme = IntegerSchemeType::UNCOMPRESSED;
       const double perSample = bestCostBits(models, metrics, samples.size(), width, scheme);
       auto& score = scores[static_cast<std::size_t>(l) * totalBits + r];

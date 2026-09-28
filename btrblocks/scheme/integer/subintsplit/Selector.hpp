@@ -19,6 +19,10 @@ namespace btrblocks::subintsplit {
 struct SelectorConfig {
   int minSectionBits{1};
   int maxSectionBits{32};
+  // Widest section the 32-bit scheme picker takes. Wider ones (possible only
+  // when maxSectionBits exceeds this, i.e. for 64-bit columns) are encoded by
+  // the 64-bit picker and priced at 64 bits of storage per value.
+  int narrowSectionBits{32};
   int maxSections{8};
   // Bits charged for each split beyond the first. Without it the DP would
   // happily carve the value into many tiny sections whose individual savings
@@ -26,7 +30,7 @@ struct SelectorConfig {
   double splitPenalty{10.0};
 };
 // -------------------------------------------------------------------------------------
-SelectorConfig defaultSelectorConfig();
+SelectorConfig defaultSelectorConfig(int valueBits = 32);
 // -------------------------------------------------------------------------------------
 // Materializes the values of a bit range, extending the range one bit at a time
 // so the inner loop of the scoring grid reuses the previous range's work

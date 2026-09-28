@@ -14,10 +14,12 @@ namespace btrblocks::integers {
 // nothing about the encoding, planning, or wire format changes here; this is
 // purely a wrapper promotion from free-standing statics to virtual overrides.
 //
-// Sections are capped at 32 bits, so once a value is decomposed each section
-// is an ordinary INTEGER stream and the whole existing 32-bit scheme pool
-// compresses it. Only the extraction and accumulation loops are 64-bit;
-// everything between them is the 32-bit machinery unchanged.
+// A section of at most 32 bits (31 with a sign-sensitive 32-bit scheme
+// enabled) is an ordinary INTEGER stream compressed by the whole existing
+// 32-bit scheme pool. A wider section, up to the full 64 bits, is extracted as
+// BIGINT and compressed by the 64-bit pool (Integer64SchemePicker, the one AUTO
+// uses for BIGINT columns), and the planner prices it at 64 bits of storage.
+// Only the extraction and accumulation loops are 64-bit.
 //
 // Bit patterns are round-tripped, so signedness is irrelevant: values are
 // taken as u64 and never arithmetically manipulated.

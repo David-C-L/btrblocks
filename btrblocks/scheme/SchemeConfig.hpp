@@ -36,11 +36,13 @@ struct SchemeConfig {
       // section costs a full INTEGER per value before sub-compression, so an
       // unbounded section count could outgrow the compression output buffer.
       uint8_t max_sections{8};
-      // widest a single section may be. Sections are handed to the ordinary
-      // 32-bit scheme picker, so this can never exceed 32; it is narrowed to
-      // 31 at plan time when a sign-sensitive sub-scheme is enabled. See
+      // widest a single section may be. A 32-bit column's sections go to the
+      // ordinary 32-bit scheme picker, so for it this is further capped at 32
+      // (31 when a sign-sensitive sub-scheme is enabled). A 64-bit column's
+      // sections wider than that go to the 64-bit picker, so for it this is
+      // the real cap; 32 restores the old behaviour. See
       // subintsplit::effectiveMaxSectionBits().
-      uint8_t max_section_bits{32};
+      uint8_t max_section_bits{64};
       // narrowest a single section may be
       uint8_t min_section_bits{1};
       // upper bound on values sampled when planning the split

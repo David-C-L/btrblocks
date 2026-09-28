@@ -33,8 +33,9 @@ values with a coarse exponent.
   pipeline as any other `ColumnType::BIGINT` codec. It started out free-standing and driven directly,
   because BtrBlocks originally had no 64-bit scheme hierarchy for it to join; that hierarchy
   (`Integer64Scheme`, `scheme/CompressionScheme64.hpp`) was added later and `SubIntSplit64` was
-  promoted onto it. Its sections are still compressed by the ordinary 32-bit pool, so it competes
-  against the same codecs either way — that part of the design never changed.
+  promoted onto it. Its sections of at most 32 bits are compressed by the ordinary 32-bit pool;
+  wider sections (up to the full 64 bits) are compressed by the 64-bit pool, the one AUTO uses for
+  `BIGINT` columns. See *Limitations* 2.
 - **Opt-in.** `SUB_INT_SPLIT` is deliberately absent from both `defaultIntegerSchemes()` and
   `defaultInteger64Schemes()`, so existing behaviour and benchmark numbers do not move unless it is
   enabled:
@@ -68,12 +69,12 @@ correctness sweep this enables at 64 bits, mirroring `RandomAccess.cpp` at 32.
 
 ## Wire format
 
-Version 1. Little-endian, packed — the destination points into the middle of a compression output
+Version 2 (version 1 differs only in never setting `flags`, and still decodes). Little-endian, packed — the destination points into the middle of a compression output
 block and is never aligned.
 
 ```
 struct SubIntSplitHeader {      // 4 bytes
-  u8 format_version;            // 1
+  u8 format_version;            // 2
   u8 section_count;             // 1..max_sections
   u8 value_bits;                // 32 or 64
   u8 reorderer_id;              // 0 = none; reserved
@@ -82,8 +83,8 @@ struct SubIntSplitHeader {      // 4 bytes
 struct SectionDescriptor {      // 8 bytes, section_count of them
   u8  bit_start;                // inclusive, from the least significant bit
   u8  bit_end;                  // inclusive
-  u8  scheme_code;              // IntegerSchemeType, or 255 for the raw fallback
-  u8  padding;
+  u8  scheme_code;              // IntegerSchemeType (Integer64SchemeType if wide), or 255 raw
+  u8  flags;                    // kSectionWide = 1: BIGINT section, 64-bit pool; else 0
   u32 offset;                   // from the start of the payload area
 };
 
@@ -138,7 +139,7 @@ Under `SchemeConfig::get().integers.subintsplit`:
 |---|---|---|
 | `split_penalty` | 10.0 | Bits charged per extra section. Raise to split less. |
 | `max_sections` | 8 | Hard cap on sections. Also a size bound — see below. |
-| `max_section_bits` | 32 | Widest section. Cannot exceed 32; narrowed to 31 automatically when a sign-sensitive scheme is enabled. |
+| `max_section_bits` | 64 | Widest section. For a 32-bit column further capped at 32 (31 when a sign-sensitive scheme is enabled). For a 64-bit column, sections wider than that go to the 64-bit pool; 32 restores the old cap. |
 | `min_section_bits` | 1 | Narrowest section. |
 | `sample_size` | 2048 | Values sampled for planning. Raising it sharpens estimates marginally and slows planning quadratically. |
 | `sample_block_size` | 128 | Contiguous sample block length. 0 selects stride sampling. |
@@ -529,6 +530,14 @@ an RLE stream's run values do not: they stay four bytes wide regardless of secti
 This also forces the planner's cost models to charge 32 bits per value for every section, which is
 less accurate than it could be. A width-parameterised sub-stream interface would recover both.
 
+Sections are no longer capped at 32 bits for 64-bit columns. A section wider than the 32-bit pool
+accepts (32 bits, or 31 when `FOR`/`Truncation8/16` are enabled, see `narrowSectionMaxBits()`) is
+extracted as `BIGINT`, compressed by `Integer64SchemePicker` and flagged `kSectionWide`; the planner
+prices it at 64 bits of storage per value (`SegmentMetrics::storageBits`). A 33-40-bit timestamp
+field can therefore stay whole, as in Nimble. The cost is the same as for narrow sections one width
+up: a wide section pays 8 bytes per value before its sub-scheme runs, and `BP64` itself compresses
+the low and high 32-bit halves separately. `max_section_bits = 32` restores the old cap.
+
 ### 3. Point access is no longer a structural dead end, but it is not free
 
 This used to be titled "there is no point-access win" and said flatly that a point lookup cost a full
@@ -583,8 +592,22 @@ cmake --build build -j --target subintsplit_bench    # explicit target: the play
 ```
 
 `--sections-csv` is what produced *Where the bytes actually go*: one row per section of each
-SubIntSplit plan, with its bit range, predicted and actual scheme, byte cost and share of the
-encoding. Omit it and nothing else changes.
+SubIntSplit plan (chunk 0), with its bit range, predicted and actual scheme, storage width (32 or 64),
+byte cost and share of the encoding. Omit it and nothing else changes. `--plans-csv` writes the
+scheme description of every chunk, since planning is per block.
+
+Every read (bulk decode, gathers, point probes, range reads) is compared with the input outside the
+timed region. The `validated` column of `--csv` is 1 only if all of them matched; a mismatch is
+logged as `VALIDATION FAILED` and the run continues.
+
+`--shared-codecs` holds both scheme pools to the codec set the cross-format comparison (Nimble,
+BtrBlocks, FastLanes) shares: `UNCOMPRESSED`, `ONE_VALUE`, `DICT` plus the fixed
+`DICTIONARY_8`/`DICTIONARY_16`, `RLE`, `PFOR`, `FREQUENCY`, `BP` and `FOR`; no truncation or delta.
+That covers the whole-column pools behind `AUTO_BASELINE64` and `AUTO_WITH_SIS64` (the latter adds
+`SubIntSplit64`), the 32-bit pool that compresses narrow sections and `BP64`'s halves, and the
+64-bit pool that compresses wide sections. A forced codec outside the set is skipped. Without the
+flag the pools are as before. Enabling 32-bit `FOR` narrows the 32-bit pool's section ceiling to 31
+bits, so 32-bit-wide sections then go to the 64-bit pool.
 
 Three datasets are generated in memory from a seed — snowflake, uniformly random, and slowly
 increasing. Uniform data is a control: it has no bit-range structure, so a split cannot help, and

@@ -4,11 +4,14 @@
 // Compares SubIntSplit against the integer codecs BtrBlocks already has, across
 // encode time, compression ratio, and the bulk, gather and point decode paths.
 //
-// The 32-bit arm runs through Relation, Datablock and BtrReader, so it measures
-// the real chunked storage path rather than a synthetic one. The 64-bit arm is
-// driven directly, because BtrBlocks has no 64-bit scheme hierarchy for it to
-// join -- but its sections are still compressed by the ordinary 32-bit pool, so
-// the comparison is against the same codecs either way.
+// Both arms run through Relation, Datablock and BtrReader, so they measure the
+// real chunked storage path rather than a synthetic one. A 64-bit column's
+// SubIntSplit sections of at most 32 bits are compressed by the ordinary 32-bit
+// pool and wider ones by the 64-bit pool, so the comparison is against the same
+// codecs either way. --shared-codecs holds both pools to the cross-format set.
+//
+// Every read is checked against the input; the `validated` column says whether
+// all of them matched.
 //
 // Two control arms matter for interpreting the results:
 //   - a fixed halves split (0-31;32-63), which isolates what the planner's
@@ -41,6 +44,7 @@
 #include <iostream>
 #include <random>
 #include <thread>
+#include <type_traits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -80,6 +84,7 @@ struct SectionRow {
   uint8_t bit_end{0};
   std::string predicted;  // what the cost models expected to win here
   std::string actual;     // what the picker chose
+  uint32_t storage_bits{32};  // 32: 32-bit pool; 64: wide section, 64-bit pool
   uint32_t bytes{0};
   double bits_per_value{0.0};
   double share_pct{0.0};  // share of the encoding this section accounts for
@@ -122,7 +127,14 @@ struct Result {
   uint32_t gather_clustered_rows{0};
   double point_ms{0.0};
   uint32_t point_count{0};
+  // Every read of the column -- bulk decode, both gathers, the point probes and
+  // every range read -- was compared with the input and matched. A mismatch
+  // clears it and the run carries on, so one broken codec cannot hide the rest.
+  bool validated{true};
   std::string plan;
+  // The scheme description of every chunk, not just chunk 0's in `plan`:
+  // planning is per block, so blocks of one column can choose differently.
+  std::vector<std::string> chunk_plans;
   // Populated only for SubIntSplit encodings.
   double plan_ms{0.0};
   bool raw_fallback{false};
@@ -154,7 +166,9 @@ void collectSections(Result& result) {
     // report. Emitting the default-constructed enum would look like a wrong
     // prediction and skew any accuracy figure computed from this file.
     row.predicted = report.forced_boundaries ? "-" : ConvertSchemeTypeToString(section.predicted);
-    row.actual = ConvertSchemeTypeToString(section.actual);
+    row.actual = section.wide ? ConvertSchemeTypeToString(section.actual64)
+                              : ConvertSchemeTypeToString(section.actual);
+    row.storage_bits = section.wide ? 64 : 32;
     row.bytes = section.bytes;
     row.bits_per_value = report.tuple_count > 0 ? (8.0 * section.bytes) / report.tuple_count : 0.0;
     row.share_pct = total > 0 ? (100.0 * section.bytes) / total : 0.0;
@@ -164,7 +178,7 @@ void collectSections(Result& result) {
 // -------------------------------------------------------------------------------------
 void writeSectionsHeader(std::ostream& out) {
   out << "width,dataset,codec,block_size,rows,section,bit_start,bit_end,bits,predicted,actual,"
-         "bytes,bits_per_value,share_pct,plan_ms,raw_fallback\n";
+         "bytes,bits_per_value,share_pct,plan_ms,raw_fallback,storage_bits\n";
 }
 // -------------------------------------------------------------------------------------
 void writeSectionRows(std::ostream& out, const Result& r) {
@@ -175,7 +189,7 @@ void writeSectionRows(std::ostream& out, const Result& r) {
         << ',' << s.actual << ',' << s.bytes << ',' << s.bits_per_value << ',' << s.share_pct
         << ','
         // Repeated per row so it survives a naive group-by.
-        << r.plan_ms << ',' << (r.raw_fallback ? 1 : 0) << '\n';
+        << r.plan_ms << ',' << (r.raw_fallback ? 1 : 0) << ',' << s.storage_bits << '\n';
   }
 }
 // -------------------------------------------------------------------------------------
@@ -197,7 +211,7 @@ std::string csvEscape(const std::string& text) {
 void writeCsvHeader(std::ostream& out) {
   out << "width,dataset,codec,rows,block_size,chunks,encoded_bytes,ratio,encode_ms,decode_ms,"
          "gather_uniform_ms,gather_uniform_chunks,gather_uniform_rows,gather_clustered_ms,"
-         "gather_clustered_chunks,gather_clustered_rows,point_ms,point_count,plan\n";
+         "gather_clustered_chunks,gather_clustered_rows,point_ms,point_count,plan,validated\n";
 }
 // -------------------------------------------------------------------------------------
 void writeCsvRow(std::ostream& out, const Result& r) {
@@ -206,7 +220,18 @@ void writeCsvRow(std::ostream& out, const Result& r) {
       << r.decode_ms << ',' << r.gather_uniform_ms << ',' << r.gather_uniform_chunks << ','
       << r.gather_uniform_rows << ',' << r.gather_clustered_ms << ',' << r.gather_clustered_chunks
       << ',' << r.gather_clustered_rows << ',' << r.point_ms << ',' << r.point_count << ','
-      << csvEscape(r.plan) << '\n';
+      << csvEscape(r.plan) << ',' << (r.validated ? 1 : 0) << '\n';
+}
+// -------------------------------------------------------------------------------------
+void writePlansHeader(std::ostream& out) {
+  out << "width,dataset,codec,block_size,chunk,plan\n";
+}
+// -------------------------------------------------------------------------------------
+void writePlanRows(std::ostream& out, const Result& r) {
+  for (std::size_t i = 0; i < r.chunk_plans.size(); i++) {
+    out << r.width << ',' << r.dataset << ',' << r.codec << ',' << r.block_size << ',' << i << ','
+        << csvEscape(r.chunk_plans[i]) << '\n';
+  }
 }
 // -------------------------------------------------------------------------------------
 // A codec under test: a top-level scheme, optionally with a forced split.
@@ -327,6 +352,31 @@ std::vector<uint32_t> g_range_offsets{8, 16, 24, 48, 24, 12, 8};
 uint32_t g_point_probes = 256;
 // Empty means every codec. Otherwise only codecs named here are run.
 std::vector<std::string> g_codec_filter;
+// --shared-codecs: hold both scheme pools to the codec set shared by all three
+// formats in the cross-format comparison (see sharedIntegerSchemes()).
+bool g_shared_codecs = false;
+// -------------------------------------------------------------------------------------
+// The codec set Nimble, BtrBlocks and FastLanes are all compared on, as
+// BtrBlocks spells it: uncompressed, one-value, dictionary (dynamic and the
+// fixed 8/16-bit-code variants), RLE, patched FOR, frequency, bit-packing and
+// FOR. Not truncation, not delta. The 32-bit pool is what compresses narrow
+// SubIntSplit sections and BP64's halves; the 64-bit pool is what AUTO picks
+// from for a BIGINT column and what compresses wide sections. SubIntSplit
+// itself is added to the 64-bit pool for AUTO_WITH_SIS64 only.
+IntegerSchemeSet sharedIntegerSchemes() {
+  return {IntegerSchemeType::UNCOMPRESSED, IntegerSchemeType::ONE_VALUE,
+          IntegerSchemeType::DICT,         IntegerSchemeType::DICTIONARY_8,
+          IntegerSchemeType::DICTIONARY_16, IntegerSchemeType::RLE,
+          IntegerSchemeType::PFOR,         IntegerSchemeType::FREQUENCY,
+          IntegerSchemeType::BP,           IntegerSchemeType::FOR};
+}
+Integer64SchemeSet sharedInteger64Schemes() {
+  return {Integer64SchemeType::UNCOMPRESSED, Integer64SchemeType::ONE_VALUE,
+          Integer64SchemeType::DICT,         Integer64SchemeType::DICTIONARY_8,
+          Integer64SchemeType::DICTIONARY_16, Integer64SchemeType::RLE,
+          Integer64SchemeType::PFOR,         Integer64SchemeType::FREQUENCY,
+          Integer64SchemeType::BP,           Integer64SchemeType::FOR};
+}
 // Range start offsets are drawn from this seed alone, so every codec, dataset
 // and block size reads the same offsets and the columns compare codecs.
 constexpr uint32_t kRangeSeed = 17;
@@ -350,9 +400,9 @@ std::vector<uint32_t> rangeStarts(uint32_t row_count, uint32_t width, uint32_t o
 // -------------------------------------------------------------------------------------
 // Times one range width. `gather` reads `count` contiguous positions starting at
 // `begin` and reports how many chunks it had to touch.
-template <typename GatherFn>
+template <typename GatherFn, typename CheckFn>
 void measureRanges(uint32_t row_count, int repeats, uint32_t seed, Result& result,
-                   const GatherFn& gather) {
+                   const GatherFn& gather, const CheckFn& check) {
   for (std::size_t w = 0; w < g_range_widths.size(); w++) {
     const uint32_t width = g_range_widths[w];
     // Falls back to the last entry when the offset schedule is shorter than
@@ -384,6 +434,15 @@ void measureRanges(uint32_t row_count, int repeats, uint32_t seed, Result& resul
         touched_total += gather(positions.data(), static_cast<uint32_t>(positions.size()));
       }
     });
+
+    // Correctness, outside the timed region: every range read once more and
+    // compared with the input.
+    for (const auto& positions : position_sets) {
+      gather(positions.data(), static_cast<uint32_t>(positions.size()));
+      if (!check(positions.data(), static_cast<uint32_t>(positions.size()))) {
+        result.validated = false;
+      }
+    }
 
     RangeRow row;
     row.width_b = width;
@@ -494,6 +553,9 @@ Result run32(const std::string& dataset_name,
     std::vector<u8> scratch;
     reader.readColumn(scratch, 0);
     result.plan = reader.getSchemeDescription(0);
+    for (u32 chunk_i = 0; chunk_i < reader.getChunkCount(); chunk_i++) {
+      result.chunk_plans.push_back(reader.getSchemeDescription(chunk_i));
+    }
   }
 
   // ---- bulk decode --------------------------------------------------------------
@@ -512,8 +574,10 @@ Result run32(const std::string& dataset_name,
 
   for (std::size_t i = 0; i < data.size(); i++) {
     if (decoded[i] != data[i]) {
-      throw Generic_Exception("decode mismatch at row " + std::to_string(i) + " for codec " +
-                              codec.name);
+      std::cerr << "VALIDATION FAILED: decode mismatch at row " << i << " for " << dataset_name
+                << "/" << codec.name << "\n";
+      result.validated = false;
+      break;
     }
   }
 
@@ -533,7 +597,10 @@ Result run32(const std::string& dataset_name,
     chunks_touched = touched;
     for (std::size_t i = 0; i < positions.size(); i++) {
       if (gathered[i] != data[positions[i]]) {
-        throw Generic_Exception("gather mismatch for codec " + codec.name);
+        std::cerr << "VALIDATION FAILED: gather mismatch for " << dataset_name << "/"
+                  << codec.name << "\n";
+        result.validated = false;
+        break;
       }
     }
   };
@@ -555,6 +622,14 @@ Result run32(const std::string& dataset_name,
       (void)value;
     }
   });
+  for (const auto position : point_positions) {
+    if (reader.lookupColumn(position) != data[position]) {
+      std::cerr << "VALIDATION FAILED: point mismatch at row " << position << " for "
+                << dataset_name << "/" << codec.name << "\n";
+      result.validated = false;
+      break;
+    }
+  }
 
   // ---- range read ---------------------------------------------------------------
   {
@@ -564,6 +639,16 @@ Result run32(const std::string& dataset_name,
                     u32 touched = 0;
                     reader.gatherColumn(range_out.data(), positions, count, &touched);
                     return touched;
+                  },
+                  [&](const uint32_t* positions, uint32_t count) {
+                    for (uint32_t i = 0; i < count; i++) {
+                      if (range_out[i] != data[positions[i]]) {
+                        std::cerr << "VALIDATION FAILED: range mismatch at row " << positions[i]
+                                  << " for " << dataset_name << "/" << codec.name << "\n";
+                        return false;
+                      }
+                    }
+                    return true;
                   });
   }
 
@@ -664,6 +749,9 @@ Result run64(const std::string& dataset_name,
     std::vector<u8> scratch;
     reader.readColumn(scratch, 0);
     result.plan = reader.getSchemeDescription(0);
+    for (u32 chunk_i = 0; chunk_i < reader.getChunkCount(); chunk_i++) {
+      result.chunk_plans.push_back(reader.getSchemeDescription(chunk_i));
+    }
   }
 
   // ---- bulk decode --------------------------------------------------------------
@@ -682,8 +770,10 @@ Result run64(const std::string& dataset_name,
 
   for (std::size_t i = 0; i < data.size(); i++) {
     if (decoded[i] != data[i]) {
-      throw Generic_Exception("decode mismatch at row " + std::to_string(i) + " for codec " +
-                              codec.name);
+      std::cerr << "VALIDATION FAILED: decode mismatch at row " << i << " for " << dataset_name
+                << "/" << codec.name << "\n";
+      result.validated = false;
+      break;
     }
   }
 
@@ -703,7 +793,10 @@ Result run64(const std::string& dataset_name,
     chunks_touched = touched;
     for (std::size_t i = 0; i < positions.size(); i++) {
       if (gathered[i] != data[positions[i]]) {
-        throw Generic_Exception("gather mismatch for codec " + codec.name);
+        std::cerr << "VALIDATION FAILED: gather mismatch for " << dataset_name << "/"
+                  << codec.name << "\n";
+        result.validated = false;
+        break;
       }
     }
   };
@@ -725,6 +818,14 @@ Result run64(const std::string& dataset_name,
       (void)value;
     }
   });
+  for (const auto position : point_positions) {
+    if (reader.lookupColumn64(position) != data[position]) {
+      std::cerr << "VALIDATION FAILED: point mismatch at row " << position << " for "
+                << dataset_name << "/" << codec.name << "\n";
+      result.validated = false;
+      break;
+    }
+  }
 
   // ---- range read ---------------------------------------------------------------
   // B contiguous elements from a uniformly drawn offset, at log-spaced B.
@@ -735,6 +836,16 @@ Result run64(const std::string& dataset_name,
                     u32 touched = 0;
                     reader.gatherColumn64(range_out.data(), positions, count, &touched);
                     return touched;
+                  },
+                  [&](const uint32_t* positions, uint32_t count) {
+                    for (uint32_t i = 0; i < count; i++) {
+                      if (range_out[i] != data[positions[i]]) {
+                        std::cerr << "VALIDATION FAILED: range mismatch at row " << positions[i]
+                                  << " for " << dataset_name << "/" << codec.name << "\n";
+                        return false;
+                      }
+                    }
+                    return true;
                   });
   }
 
@@ -890,6 +1001,7 @@ void writeRunMetadata(const std::string& path, int repeats, uint32_t rows) {
   }
   out << "\n";
   out << "codec_set," << (g_codec_filter.empty() ? "all" : "restricted") << "\n";
+  out << "scheme_pools," << (g_shared_codecs ? "shared" : "default") << "\n";
   out << "range_seed," << kRangeSeed << "\n";
 }
 // -------------------------------------------------------------------------------------
@@ -933,6 +1045,7 @@ int main(int argc, char** argv) {
   uint32_t seed = 42;
   std::string csv_path;
   std::string sections_csv_path;
+  std::string plans_csv_path;
   std::string input_i64;
   std::string range_csv_path;
   std::string metadata_path;
@@ -958,6 +1071,10 @@ int main(int argc, char** argv) {
       sections_csv_path = next();
     } else if (arg == "--range-csv") {
       range_csv_path = next();
+    } else if (arg == "--plans-csv") {
+      plans_csv_path = next();
+    } else if (arg == "--shared-codecs") {
+      g_shared_codecs = true;
     } else if (arg == "--metadata-csv") {
       metadata_path = next();
     } else if (arg == "--range-widths") {
@@ -992,7 +1109,19 @@ int main(int argc, char** argv) {
                    "                         [--dataset NAME=PATH]... [--sections-csv PATH]\n"
                    "                         [--range-csv PATH] [--metadata-csv PATH]\n"
                    "                         [--range-widths a,b,c] [--range-offsets N]\n"
-                   "                         [--point-probes N]\n"
+                   "                         [--point-probes N] [--plans-csv PATH]\n"
+                   "                         [--shared-codecs]\n"
+                   "\n"
+                   "  --shared-codecs      hold the 32- and 64-bit scheme pools (whole columns,\n"
+                   "                       AUTO arms, SubIntSplit sections) to the codec set the\n"
+                   "                       cross-format comparison shares: UNCOMPRESSED,\n"
+                   "                       ONE_VALUE, DICT (+ 8/16-bit fixed), RLE, PFOR,\n"
+                   "                       FREQUENCY, BP, FOR. SubIntSplit64 is added for\n"
+                   "                       AUTO_WITH_SIS64 only. A forced codec outside the\n"
+                   "                       set is skipped. Default: the pools below.\n"
+                   "\n"
+                   "  --plans-csv PATH     write every chunk's scheme description (the plan\n"
+                   "                       column of --csv covers chunk 0 only).\n"
                    "\n"
                    "  --input-i64 PATH     add a 64-bit dataset read from a flat little-endian\n"
                    "                       int64 file, for measuring against real data rather\n"
@@ -1025,6 +1154,12 @@ int main(int argc, char** argv) {
   }
 
   BtrBlocksConfig::configure([](BtrBlocksConfig& config) {
+    if (g_shared_codecs) {
+      config.integers.schemes = sharedIntegerSchemes();
+      config.integers64.schemes = sharedInteger64Schemes();
+      config.integers64.schemes.enable(Integer64SchemeType::SUB_INT_SPLIT);
+      return;
+    }
     config.integers.schemes = defaultIntegerSchemes();
     config.integers.schemes.enable(IntegerSchemeType::SUB_INT_SPLIT);
     config.integers64.schemes = defaultInteger64Schemes();
@@ -1146,6 +1281,15 @@ int main(int argc, char** argv) {
     }
     writeSectionsHeader(sections_file);
   }
+  std::ofstream plans_file;
+  if (!plans_csv_path.empty()) {
+    plans_file.open(plans_csv_path);
+    if (!plans_file.good()) {
+      std::cerr << "cannot open " << plans_csv_path << "\n";
+      return 1;
+    }
+    writePlansHeader(plans_file);
+  }
   std::ofstream range_file;
   if (!range_csv_path.empty()) {
     range_file.open(range_csv_path);
@@ -1162,6 +1306,23 @@ int main(int argc, char** argv) {
     }
     if (range_file.is_open()) {
       writeRangeRows(range_file, result);
+    }
+    if (plans_file.is_open()) {
+      writePlanRows(plans_file, result);
+    }
+  };
+  // A forced codec whose scheme is outside the enabled pool has nothing to
+  // force (the pool lookup would dereference a missing scheme), so under
+  // --shared-codecs it is skipped rather than run.
+  const auto forcedSchemeMissing = [](const auto& codec) {
+    if (codec.automatic) {
+      return false;
+    }
+    using SchemeCode = std::decay_t<decltype(codec.scheme)>;
+    if constexpr (std::is_same_v<SchemeCode, IntegerSchemeType>) {
+      return !BtrBlocksConfig::get().integers.schemes.isEnabled(codec.scheme);
+    } else {
+      return !BtrBlocksConfig::get().integers64.schemes.isEnabled(codec.scheme);
     }
   };
 
@@ -1197,6 +1358,11 @@ int main(int argc, char** argv) {
         if (!codecSelected(codec.name)) {
           continue;
         }
+        if (forcedSchemeMissing(codec)) {
+          std::cerr << "skip 32/" << dataset.name << "/" << codec.name
+                    << ": scheme not in the pool\n";
+          continue;
+        }
         std::cerr << "32/" << dataset.name << "/" << codec.name << " @" << block_size << "\n";
         emit(run32(dataset.name, dataset.data, codec, block_size, repeats));
       }
@@ -1204,6 +1370,11 @@ int main(int argc, char** argv) {
     for (const auto& dataset : datasets64) {
       for (const auto& codec : codecs64) {
         if (!codecSelected(codec.name)) {
+          continue;
+        }
+        if (forcedSchemeMissing(codec)) {
+          std::cerr << "skip 64/" << dataset.name << "/" << codec.name
+                    << ": scheme not in the pool\n";
           continue;
         }
         std::cerr << "64/" << dataset.name << "/" << codec.name << " @" << block_size << "\n";
@@ -1216,6 +1387,9 @@ int main(int argc, char** argv) {
     }
     if (range_file.is_open()) {
       range_file.flush();
+    }
+    if (plans_file.is_open()) {
+      plans_file.flush();
     }
   }
 

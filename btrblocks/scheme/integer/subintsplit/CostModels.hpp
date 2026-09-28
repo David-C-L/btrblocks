@@ -26,13 +26,18 @@ namespace btrblocks::subintsplit {
 // -------------------------------------------------------------------------------------
 // Number of bits a section value occupies before sub-compression.
 //
-// Always 32: a section is handed to the ordinary integer scheme picker, whose
-// input is INTEGER, so even a 1-bit section costs a full 4 bytes per value
-// until its sub-scheme compresses it. (Nimble narrows a section to the smallest
-// physical type that fits, which is why its equivalent returns 8/16/32/64 --
-// porting that verbatim would make every model under-charge narrow sections and
-// the planner would over-split.)
+// 32 for a section handed to the ordinary integer scheme picker, whose input is
+// INTEGER, so even a 1-bit section costs a full 4 bytes per value until its
+// sub-scheme compresses it. (Nimble narrows a section to the smallest physical
+// type that fits, which is why its equivalent returns 8/16/32/64 -- porting
+// that verbatim would make every model under-charge narrow sections and the
+// planner would over-split.)
 inline constexpr int kSectionStorageBits = 32;
+// A section wider than the 32-bit picker accepts is extracted as BIGINT and
+// compressed by the 64-bit picker, so it costs 8 bytes per value before
+// sub-compression. The planner records which one applies in
+// SegmentMetrics::storageBits; the models read that rather than a constant.
+inline constexpr int kWideSectionStorageBits = 64;
 // -------------------------------------------------------------------------------------
 inline int bitWidthOf(uint64_t value) noexcept {
   return value == 0 ? 0 : 64 - __builtin_clzll(value);
@@ -58,8 +63,8 @@ struct ICostModel {
 // -------------------------------------------------------------------------------------
 // UNCOMPRESSED: every value stored raw.
 struct UncompressedCostModel : ICostModel {
-  double costBits(const SegmentMetrics&, std::size_t numValues, int) const override {
-    return static_cast<double>(numValues) * kSectionStorageBits;
+  double costBits(const SegmentMetrics& m, std::size_t numValues, int) const override {
+    return static_cast<double>(numValues) * m.storageBits;
   }
   MetricFlags requiredMetrics() const override {
     return static_cast<MetricFlags>(MetricFlag::None);
@@ -94,7 +99,7 @@ struct OneValueCostModel : ICostModel {
     if (m.min != m.max) {
       return std::numeric_limits<double>::infinity();
     }
-    return kSectionStorageBits;
+    return m.storageBits;
   }
   MetricFlags requiredMetrics() const override {
     return static_cast<MetricFlags>(MetricFlag::MinMax);
@@ -140,7 +145,7 @@ struct DictionaryCostModel : ICostModel {
       return std::numeric_limits<double>::infinity();
     }
     const std::size_t uniques = m.uniqueCount;
-    const double dictBits = static_cast<double>(uniques) * kSectionStorageBits;
+    const double dictBits = static_cast<double>(uniques) * m.storageBits;
     const int codeBits = uniques <= 1 ? 1 : bitWidthOf(static_cast<uint64_t>(uniques - 1));
     const double codesBits = static_cast<double>(codeBits) * static_cast<double>(numValues);
     // DynamicDictionaryStructure plus the nested header for the codes stream.
